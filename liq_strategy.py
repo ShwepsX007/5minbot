@@ -612,6 +612,34 @@ def _get_trade_stats(is_demo: int):
     }
 
 
+def _ws_status_line() -> str:
+    """Строка диагностики WS-источников ликвидаций.
+
+    Bybit / Binance / Gate.io работают через публичные WebSocket-стримы
+    (REST у Binance и Gate требует API-ключей с подписью), OKX — через
+    публичный REST, поэтому его тут нет.
+    """
+    try:
+        health = liq_api.ws_health()
+    except Exception:
+        return "📡 WS: нет данных"
+
+    titles = {"bybit": "Bybit", "binance": "Binance", "gate": "Gate.io"}
+    parts = []
+    for key, title in titles.items():
+        h = health.get(key) or {}
+        mark = "🟢" if h.get("connected") else "🔴"
+        age = h.get("age_sec")
+        if age is None:
+            when = "событий не было"
+        elif age < 90:
+            when = f"{int(age)}с назад"
+        else:
+            when = f"{int(age // 60)}м назад"
+        parts.append(f"{mark} {title} ({h.get('buffered', 0)}, {when})")
+    return "📡 WS ликвидаций: " + " | ".join(parts)
+
+
 def get_status_text() -> str:
     st = _load_state()
     c = cfg()
@@ -634,6 +662,7 @@ def get_status_text() -> str:
     lines.append(f"🏁 TP: *{c['liq_tp_cents']}¢* | ⏰ Страховка: *{c['liq_new_order_time']}с* до конца окна | 🕘 В списке: *{c['liq_recent_count']}* сделок")
     lines.append(f"🔁 Чек: {c['liq_check_interval']}с | 👁 Скан: {c['liq_scan_interval']}с")
     lines.append(f"📊 *Свеча берётся с Gate.io SPOT* (а не фьючерсов) — это та же цена, что на графике Polymarket Up/Down")
+    lines.append(_ws_status_line())
     lines.append("")
 
     # Глобальный стоп-индикатор в статусе
@@ -974,11 +1003,11 @@ async def scan_for_signal(context):
     symbols = get_selected_symbols()
     if not symbols:
         return
-    # Подписываем Bybit WS сразу на все нужные монеты
+    # Подписываем WS всех бирж (Bybit/Binance/Gate) на нужные монеты
     try:
-        liq_api.set_bybit_symbols(symbols)
+        liq_api.set_symbols(symbols)
     except Exception as e:
-        log.debug(f"set_bybit_symbols err: {e}")
+        log.debug(f"set_symbols err: {e}")
 
     state = _load_state()
     async with aiohttp.ClientSession() as session:

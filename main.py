@@ -35,9 +35,32 @@ async def post_init(application):
     that started without an admin interaction had no liq_signal_job
     registered at all — the signal scanner would never run.
     """
-    task = asyncio.create_task(liq_api.bybit_ws_listener(), name="bybit_liquidations")
-    application.bot_data["bybit_liquidations_task"] = task
-    log.info("Bybit liquidation listener task created")
+    # Публичные WS-стримы ликвидаций (без API-ключей):
+    #   Bybit   — allLiquidation.<SYMBOL>
+    #   Binance — !forceOrder@arr
+    #   Gate.io — futures.public_liquidates
+    # REST-эндпоинты Binance (/fapi/v1/forceOrders) и Gate (/liq_orders)
+    # требуют подписи, поэтому все три биржи работают через WS.
+    # Заранее сообщаем WS, какие монеты нужны, чтобы Gate успел
+    # подписаться до первого скана, а Binance не копил чужие символы.
+    try:
+        import liq_strategy as ls
+        liq_api.set_symbols(ls.get_selected_symbols())
+    except Exception as e:
+        log.debug(f"set_symbols on startup failed: {e}")
+
+    listeners = {
+        "bybit_liquidations": liq_api.bybit_ws_listener,
+        "binance_liquidations": liq_api.binance_ws_listener,
+        "gate_liquidations": liq_api.gate_ws_listener,
+    }
+    tasks = []
+    for name, factory in listeners.items():
+        task = asyncio.create_task(factory(), name=name)
+        application.bot_data[f"{name}_task"] = task
+        tasks.append(task)
+        log.info(f"{name} listener task created")
+    application.bot_data["liq_ws_tasks"] = tasks
 
     # Schedule background jobs for every admin. schedule_jobs is safe
     # to call multiple times — it removes existing jobs by name first.
@@ -53,14 +76,28 @@ async def post_init(application):
 
 async def post_shutdown(application):
     """Cancel and await the websocket before systemd's stop timeout expires."""
-    task = application.bot_data.pop("bybit_liquidations_task", None)
-    if task and not task.done():
-        task.cancel()
+    tasks = application.bot_data.pop("liq_ws_tasks", [])
+    for name in (
+        "bybit_liquidations",
+        "binance_liquidations",
+        "gate_liquidations",
+    ):
+        task = application.bot_data.pop(f"{name}_task", None)
+        if task and task not in tasks:
+            tasks.append(task)
+    for task in tasks:
+        if task and not task.done():
+            task.cancel()
+    for task in tasks:
+        if not task:
+            continue
         try:
             await task
         except asyncio.CancelledError:
             pass
-    log.info("Bybit liquidation listener stopped")
+        except Exception as e:
+            log.debug(f"listener stop err: {e}")
+    log.info("Liquidation WS listeners stopped")
 
 def main():
     if not TOKEN:

@@ -400,9 +400,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Обновим подписку Bybit WS, чтобы новые монеты начали литься
             try:
                 import liq_api as _la
-                _la.set_bybit_symbols(ls.get_selected_symbols())
+                _la.set_symbols(ls.get_selected_symbols())
             except Exception as e:
-                log.debug(f"set_bybit_symbols err: {e}")
+                log.debug(f"set_symbols err: {e}")
             return await q.edit_message_text(
                 liq_menu.pairs_view_text(),
                 parse_mode="Markdown",
@@ -413,9 +413,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ls.set_selected_symbols(list(ls.AVAILABLE_SYMBOLS))
             try:
                 import liq_api as _la
-                _la.set_bybit_symbols(ls.get_selected_symbols())
+                _la.set_symbols(ls.get_selected_symbols())
             except Exception as e:
-                log.debug(f"set_bybit_symbols err: {e}")
+                log.debug(f"set_symbols err: {e}")
             return await q.edit_message_text(
                 liq_menu.pairs_view_text(),
                 parse_mode="Markdown",

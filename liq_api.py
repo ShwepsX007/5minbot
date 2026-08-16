@@ -36,11 +36,47 @@ _bybit_supported_ts = 0
 _bybit_last_plan_signature = None
 _BYBIT_SUPPORTED_TTL = 21600
 
+# Binance WS (публичный стрим ликвидаций !forceOrder@arr).
+# REST /fapi/v1/forceOrders требует HMAC-подписи (USER_DATA) и без ключей
+# отдаёт пустой ответ/ошибку, поэтому источник — только WS.
+_binance_ws_events = []
+_binance_ws_lock = asyncio.Lock()
+_binance_desired_symbols = set()   # {'BTC_USDT', ...}; пусто = принимать всё
+
+# Gate.io WS (публичный канал futures.public_liquidates).
+# REST /futures/usdt/liq_orders в актуальной версии API также закрыт,
+# поэтому источник — только WS.
+_gate_ws_events = []
+_gate_ws_lock = asyncio.Lock()
+_gate_desired_symbols = set()      # {'BTC_USDT', ...}
+_gate_subscribed_symbols = set()
+_gate_ws_ref = {"ws": None}        # текущее соединение для доп. подписок
+
+# Сколько секунд держим события в WS-буферах (буфер стратегии — 600с)
+_WS_BUFFER_TTL = 600
+
+# Диагностика WS-соединений (видна в статусе стратегии / логах)
+_ws_status = {
+    'bybit': {'connected': False, 'last_event_ts': 0.0, 'events': 0},
+    'binance': {'connected': False, 'last_event_ts': 0.0, 'events': 0},
+    'gate': {'connected': False, 'last_event_ts': 0.0, 'events': 0},
+}
+
 GATE_BASE = "https://api.gateio.ws/api/v4/futures/usdt"
 OKX_BASE = "https://www.okx.com/api/v5/public"
 BYBIT_REST_BASE = "https://api.bybit.com/v5/market"
 BYBIT_WS = "wss://stream.bybit.com/v5/public/linear"
-BINANCE_FAPI = "https://fapi.binance.com"  # USDT-M Futures forceOrders endpoint
+BINANCE_FAPI = "https://fapi.binance.com"
+
+# Binance перенёс публичные стримы на /market (legacy /ws отключается),
+# поэтому пробуем новый адрес, а при неудаче — старый.
+BINANCE_WS_URLS = (
+    "wss://fstream.binance.com/market/ws/!forceOrder@arr",
+    "wss://fstream.binance.com/ws/!forceOrder@arr",
+)
+
+GATE_WS = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+GATE_LIQ_CHANNEL = "futures.public_liquidates"
 
 
 # ============== ХЕЛПЕРЫ ==============
@@ -49,7 +85,8 @@ def normalize_symbol(symbol: str, exchange: str) -> str:
     s = symbol.upper()
     s = s.replace('-SWAP', '')
     s = s.replace('-', '_')
-    if exchange == 'bybit':
+    if exchange in ('bybit', 'binance', 'gate'):
+        # BTCUSDT -> BTC_USDT (Gate уже отдаёт с подчёркиванием)
         if s.endswith('USDT') and '_' not in s:
             s = s[:-4] + '_USDT'
     return s
@@ -165,61 +202,35 @@ async def get_gate_contract_spec(
 
 
 async def get_gate_liquidations(
-        session, contract, min_usd=10000):
+        session=None, contract=None, min_usd=10000):
+    """Ликвидации Gate.io из буфера публичного WS.
 
-    spec = await get_gate_contract_spec(
-        session, contract)
-    if not spec:
+    Источник — канал futures.public_liquidates на
+    wss://fx-ws.gateio.ws/v4/ws/usdt (без авторизации).
+    REST /futures/usdt/liq_orders закрыт (нужны ключи и подпись),
+    поэтому здесь только чтение буфера, который наполняет
+    gate_ws_listener().
+
+    Аргумент session сохранён для обратной совместимости с
+    get_all_liquidations() и не используется.
+    """
+    if not contract:
         return []
 
-    quanto = float(
-        spec.get('quanto_multiplier', 0.0001))
+    target = normalize_symbol(contract, 'gate')
+    last_ts = _last_seen['gate'].get(target, 0)
 
-    url = f"{GATE_BASE}/liq_orders"
-    orders = await fetch_json(
-        session, url,
-        params={'contract': contract, 'limit': 100})
+    async with _gate_ws_lock:
+        events = [
+            e for e in _gate_ws_events
+            if e['symbol'] == target
+            and e['usd_value'] >= min_usd
+            and e['time'] > last_ts
+        ]
 
-    if not orders:
-        return []
-
-    last_ts = _last_seen['gate'].get(contract, 0)
-    events = []
-    max_ts = last_ts
-
-    for o in orders:
-        ts = o.get('time', 0)
-        if ts <= last_ts:
-            continue
-
-        size = abs(o.get('size', 0))
-        order_size = o.get('order_size', 0)
-        fill_price = float(o.get('fill_price', 0))
-
-        if size == 0 or fill_price == 0:
-            continue
-
-        usd = size * quanto * fill_price
-        if usd < min_usd:
-            continue
-
-        events.append({
-            'exchange': 'Gate.io',
-            'symbol': normalize_symbol(
-                contract, 'gate'),
-            'time': ts,
-            'direction': (
-                "LONG" if order_size < 0
-                else "SHORT"),
-            'usd_value': usd,
-            'price': fill_price,
-        })
-
-        if ts > max_ts:
-            max_ts = ts
-
-    if max_ts > last_ts:
-        _last_seen['gate'][contract] = max_ts
+    if events:
+        _last_seen['gate'][target] = max(
+            e['time'] for e in events)
 
     return events
 
@@ -682,6 +693,7 @@ async def bybit_ws_listener():
                 BYBIT_WS, heartbeat=20, autoping=True)
 
             print("[Bybit WS] Connected!")
+            _ws_status['bybit']['connected'] = True
             _bybit_subscribed_topics = set()
             _bybit_last_plan_signature = None
 
@@ -756,6 +768,10 @@ async def bybit_ws_listener():
                             if e['time'] >= cutoff
                         ]
 
+                    _ws_status['bybit']['events'] += len(parsed)
+                    _ws_status['bybit']['last_event_ts'] = (
+                        time.time())
+
                     for ev in parsed:
                         if ev['usd_value'] >= 50000:
                             print(
@@ -776,6 +792,7 @@ async def bybit_ws_listener():
         except Exception as e:
             print(f"[Bybit WS] err: {e}")
         finally:
+            _ws_status['bybit']['connected'] = False
             try:
                 if ws and not ws.closed:
                     await ws.close()
@@ -849,101 +866,527 @@ async def get_bybit_liquidations(
 
 
 # ==================================================
-#                    BINANCE
+#                    BINANCE (WS)
 # ==================================================
 
-async def get_binance_liquidations(
-        session, base_symbol, min_usd=10000):
-    """Ликвидации с Binance USDT-M Futures.
+def set_binance_symbols(symbols: list):
+    """Список монет, которые кладём в буфер Binance WS.
 
-    Источник: GET https://fapi.binance.com/fapi/v1/forceOrders
-    Возвращает только USDT-M (linear) контракты. Без API ключей,
-    но endpoint публичный. Binance — крупнейшая биржа по объёмам,
-    у них самые большие ликвидационные каскады, поэтому подключение
-    этой биржи критично для детекции крупных каскадов.
-
-    Поддерживает lookback только до 7 дней, после чего Binance
-    очищает историю. Дельта-фильтрация через _last_seen['binance']
-    работает корректно даже после перезапуска бота: при первом
-    запуске last_ts=0 и бот получит все ликвидации за последние
-    100 записей — обычно это последние минуты/часы.
-
-    Формат forceOrders (документация Binance):
-    {
-      "symbol": "BTCUSDT",
-      "orderId": 12345,
-      "price": "30000.00",
-      "qty": "0.500",
-      "side": "BUY" | "SELL",   # сторона ордера ликвидации
-      "time": 1700000000000,    # ms epoch
-      "avgPrice": "30000.00",
-      "executedQty": "0.500",
-      ...
-    }
-    Сторона "BUY" = ликвидация SHORT позиции (forced buyback)
-    Сторона "SELL" = ликвидация LONG позиции (forced sell)
-    Поэтому в нашей логике:
-      side SELL → liquidated_long → direction "LONG"
-      side BUY  → liquidated_short → direction "SHORT"
+    Стрим !forceOrder@arr отдаёт ликвидации по ВСЕМ символам биржи,
+    поэтому фильтруем на входе, чтобы не раздувать память.
+    Пустой список = принимать всё.
     """
-    symbol = base_symbol.replace('_USDT', '') + 'USDT'
-    last_ts = _last_seen['binance'].get(base_symbol, 0)
+    global _binance_desired_symbols
+    desired = set()
+    for sym in (symbols or []):
+        if sym:
+            desired.add(normalize_symbol(str(sym), 'binance'))
+    _binance_desired_symbols = desired
 
-    url = f"{BINANCE_FAPI}/fapi/v1/forceOrders"
-    data = await fetch_json(
-        session, url,
-        params={'symbol': symbol, 'limit': 100}
-    )
 
-    if not data or not isinstance(data, list):
+def _parse_binance_ws_event(data):
+    """Парсит сообщение стрима !forceOrder@arr.
+
+    Формат (документация Binance USDⓈ-M Futures):
+    {
+      "e": "forceOrder",
+      "E": 1591154240950,        # event time, ms
+      "o": {
+        "s": "BTCUSDT",          # symbol
+        "S": "SELL",             # сторона ордера ликвидации
+        "q": "0.014",            # исходное количество
+        "p": "9425.5",           # цена ордера
+        "ap": "9496.5",          # средняя цена исполнения
+        "X": "FILLED",           # статус
+        "l": "0.014",            # последнее исполненное количество
+        "z": "0.014",            # накопленное исполненное количество
+        "T": 1591154240949       # trade time, ms
+      }
+    }
+    SELL = принудительная продажа  → ликвидирован LONG  → direction "LONG"
+    BUY  = принудительная покупка → ликвидирован SHORT → direction "SHORT"
+    """
+    try:
+        if not isinstance(data, dict):
+            return None
+        # combined-stream обёртка {"stream": ..., "data": {...}}
+        if 'data' in data and 'e' not in data:
+            data = data.get('data') or {}
+        if data.get('e') != 'forceOrder':
+            return None
+
+        o = data.get('o') or {}
+        sym = str(o.get('s') or '').upper()
+        side = str(o.get('S') or '').upper()
+        if not sym or not side:
+            return None
+
+        qty = 0.0
+        for key in ('z', 'l', 'q'):
+            try:
+                qty = float(o.get(key) or 0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            if qty > 0:
+                break
+
+        price = 0.0
+        for key in ('ap', 'p'):
+            try:
+                price = float(o.get(key) or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            if price > 0:
+                break
+
+        if qty <= 0 or price <= 0:
+            return None
+
+        ts_ms = o.get('T') or data.get('E') or 0
+        try:
+            ts = float(ts_ms) / 1000.0 if ts_ms else time.time()
+        except (TypeError, ValueError):
+            ts = time.time()
+
+        return {
+            'exchange': 'Binance',
+            'symbol': normalize_symbol(sym, 'binance'),
+            'time': ts,
+            'direction': "LONG" if side == "SELL" else "SHORT",
+            'usd_value': qty * price,
+            'price': price,
+        }
+    except Exception:
+        return None
+
+
+async def binance_ws_listener():
+    """Публичный WS-стрим ликвидаций Binance USDⓈ-M Futures.
+
+    wss://fstream.binance.com/market/ws/!forceOrder@arr — без ключей и
+    подписи (REST /fapi/v1/forceOrders требует HMAC и потому не годится).
+    Стрим отдаёт ликвидации по всем символам, снапшотом не чаще
+    1 сообщения в секунду на символ. Автопереподключение — как у Bybit.
+    """
+    global _binance_ws_events
+
+    url_idx = 0
+
+    while True:
+        session = None
+        ws = None
+        url = BINANCE_WS_URLS[url_idx % len(BINANCE_WS_URLS)]
+
+        try:
+            print(f"[Binance WS] Connecting {url} ...")
+
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None))
+            ws = await session.ws_connect(
+                url, heartbeat=20, autoping=True)
+
+            _ws_status['binance']['connected'] = True
+            print("[Binance WS] Connected!")
+
+            while True:
+                try:
+                    msg = await asyncio.wait_for(
+                        ws.receive(), timeout=30)
+                except asyncio.TimeoutError:
+                    continue
+
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                    except Exception:
+                        continue
+
+                    raw = data
+                    if isinstance(raw, list):
+                        items = raw
+                    else:
+                        items = [raw]
+
+                    parsed = []
+                    for item in items:
+                        ev = _parse_binance_ws_event(item)
+                        if not ev:
+                            continue
+                        if (_binance_desired_symbols and
+                                ev['symbol'] not in
+                                _binance_desired_symbols):
+                            continue
+                        parsed.append(ev)
+
+                    if not parsed:
+                        continue
+
+                    async with _binance_ws_lock:
+                        _binance_ws_events.extend(parsed)
+                        cutoff = time.time() - _WS_BUFFER_TTL
+                        _binance_ws_events = [
+                            e for e in _binance_ws_events
+                            if e['time'] >= cutoff
+                        ]
+
+                    _ws_status['binance']['events'] += len(parsed)
+                    _ws_status['binance']['last_event_ts'] = (
+                        time.time())
+
+                    for ev in parsed:
+                        if ev['usd_value'] >= 50000:
+                            print(
+                                f"[Binance WS] "
+                                f"{ev['symbol']} "
+                                f"{ev['direction']} "
+                                f"${ev['usd_value']:,.0f}")
+
+                elif msg.type in (
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.ERROR):
+                    print("[Binance WS] Lost")
+                    # Возможно, адрес устарел — пробуем следующий
+                    url_idx += 1
+                    break
+
+        except asyncio.CancelledError:
+            print("[Binance WS] остановлен")
+            raise
+        except Exception as e:
+            print(f"[Binance WS] err: {e}")
+            url_idx += 1
+        finally:
+            _ws_status['binance']['connected'] = False
+            try:
+                if ws and not ws.closed:
+                    await ws.close()
+            except Exception:
+                pass
+            try:
+                if session and not session.closed:
+                    await session.close()
+            except Exception:
+                pass
+
+        print("[Binance WS] Reconnect 5s...")
+        await asyncio.sleep(5)
+
+
+async def get_binance_liquidations(
+        session=None, base_symbol=None, min_usd=10000):
+    """Ликвидации Binance из буфера публичного WS.
+
+    Аргумент session оставлен для обратной совместимости с
+    get_all_liquidations() и не используется.
+    """
+    if not base_symbol:
         return []
 
-    events = []
-    max_ts = last_ts
+    target = normalize_symbol(base_symbol, 'binance')
+    last_ts = _last_seen['binance'].get(target, 0)
 
-    for o in data:
-        # Binance отдаёт time в миллисекундах
-        ts_ms = o.get('time', 0)
-        if not ts_ms:
+    async with _binance_ws_lock:
+        events = [
+            e for e in _binance_ws_events
+            if e['symbol'] == target
+            and e['usd_value'] >= min_usd
+            and e['time'] > last_ts
+        ]
+
+    if events:
+        _last_seen['binance'][target] = max(
+            e['time'] for e in events)
+
+    return events
+
+
+# ==================================================
+#                   GATE.IO (WS)
+# ==================================================
+
+def set_gate_symbols(symbols: list):
+    """Контракты, на которые подписывается Gate.io WS."""
+    global _gate_desired_symbols
+    desired = set()
+    for sym in (symbols or []):
+        if sym:
+            desired.add(normalize_symbol(str(sym), 'gate'))
+    _gate_desired_symbols = desired
+
+
+def set_symbols(symbols: list):
+    """Единая точка: задать монеты сразу для всех WS-источников."""
+    set_bybit_symbols(symbols)
+    set_binance_symbols(symbols)
+    set_gate_symbols(symbols)
+
+
+def ensure_symbol(symbol: str):
+    """Добавляет монету к подпискам WS, не сбрасывая остальные."""
+    if not symbol:
+        return
+    norm = normalize_symbol(str(symbol), 'gate')
+    if norm not in _gate_desired_symbols:
+        _gate_desired_symbols.add(norm)
+    if _binance_desired_symbols and norm not in _binance_desired_symbols:
+        _binance_desired_symbols.add(norm)
+    bybit_sym = norm.replace('_', '')
+    if bybit_sym not in _bybit_desired_symbols:
+        _bybit_desired_symbols.add(bybit_sym)
+
+
+async def _gate_quanto(session, contract):
+    """quanto_multiplier контракта (размер 1 контракта в базовой монете)."""
+    spec = await get_gate_contract_spec(session, contract)
+    if not spec:
+        return None
+    try:
+        q = float(spec.get('quanto_multiplier') or 0)
+    except (TypeError, ValueError):
+        return None
+    return q if q > 0 else None
+
+
+async def _gate_subscribe_pending(ws, session):
+    """Досылает подписки на новые контракты (idempotent)."""
+    global _gate_subscribed_symbols
+
+    pending = sorted(
+        _gate_desired_symbols - _gate_subscribed_symbols)
+    if not pending:
+        return
+
+    for contract in pending:
+        # Прогреваем кэш спецификации: без quanto_multiplier
+        # мы не сможем пересчитать размер в USD.
+        try:
+            await _gate_quanto(session, contract)
+        except Exception:
+            pass
+
+    try:
+        await ws.send_json({
+            "time": int(time.time()),
+            "channel": GATE_LIQ_CHANNEL,
+            "event": "subscribe",
+            "payload": pending,
+        })
+        _gate_subscribed_symbols |= set(pending)
+        print(
+            f"[Gate WS] sub: {', '.join(pending)}")
+    except Exception as e:
+        print(f"[Gate WS] sub err: {e}")
+
+
+async def _parse_gate_ws_events(session, data):
+    """Парсит уведомление канала futures.public_liquidates.
+
+    {
+      "channel": "futures.public_liquidates",
+      "event": "update",
+      "time": 1541505434,
+      "time_ms": 1541505434123,
+      "result": [
+        {"price": "215.1", "size": "-124.5",
+         "time": 1541486601, "contract": "BTC_USDT"}
+      ]
+    }
+    size < 0 — принудительная продажа → ликвидирован LONG.
+    size > 0 — принудительная покупка → ликвидирован SHORT.
+    size указан в КОНТРАКТАХ, поэтому объём в USD считаем как
+    |size| * quanto_multiplier * price.
+    """
+    out = []
+    result = data.get('result')
+    if isinstance(result, dict):
+        result = [result]
+    if not isinstance(result, list):
+        return out
+
+    for item in result:
+        if not isinstance(item, dict):
             continue
-        ts = float(ts_ms) / 1000.0
-        # Дельта-фильтрация (time в секундах, last_ts в секундах)
-        if ts <= last_ts:
+        contract = str(
+            item.get('contract') or '').upper().replace('-', '_')
+        if not contract:
             continue
 
         try:
-            price = float(o.get('avgPrice') or o.get('price') or 0)
-            qty = float(o.get('executedQty') or o.get('qty') or 0)
+            size = float(item.get('size') or 0)
+            price = float(item.get('price') or 0)
         except (TypeError, ValueError):
             continue
-        if price <= 0 or qty <= 0:
+        if size == 0 or price <= 0:
             continue
 
-        usd = price * qty
-        if usd < min_usd:
+        quanto = await _gate_quanto(session, contract)
+        if not quanto:
+            # Без множителя объём посчитать нельзя — пропускаем,
+            # чтобы не завышать/занижать каскад.
             continue
 
-        side = str(o.get('side', '')).upper()
-        # SELL = закрытие LONG (forced sell) → direction "LONG"
-        # BUY  = закрытие SHORT (forced buy) → direction "SHORT"
-        direction = "LONG" if side == "SELL" else "SHORT"
+        ts_raw = (
+            item.get('time_ms') or item.get('time') or
+            data.get('time_ms') or data.get('time') or 0)
+        try:
+            ts = float(ts_raw)
+            if ts > 10_000_000_000:
+                ts = ts / 1000.0
+        except (TypeError, ValueError):
+            ts = time.time()
+        if not ts:
+            ts = time.time()
 
-        events.append({
-            'exchange': 'Binance',
-            'symbol': base_symbol,
+        out.append({
+            'exchange': 'Gate.io',
+            'symbol': normalize_symbol(contract, 'gate'),
             'time': ts,
-            'direction': direction,
-            'usd_value': usd,
+            'direction': "LONG" if size < 0 else "SHORT",
+            'usd_value': abs(size) * quanto * price,
             'price': price,
         })
 
-        if ts > max_ts:
-            max_ts = ts
+    return out
 
-    if max_ts > last_ts:
-        _last_seen['binance'][base_symbol] = max_ts
 
-    return events
+async def gate_ws_listener():
+    """Публичный WS Gate.io: канал futures.public_liquidates.
+
+    wss://fx-ws.gateio.ws/v4/ws/usdt — авторизация не нужна
+    (в отличие от REST /futures/usdt/liq_orders и приватного
+    канала futures.liquidates). Подписка идёт на выбранные в
+    стратегии контракты; список обновляется каждые 15 секунд.
+    """
+    global _gate_ws_events
+    global _gate_subscribed_symbols
+
+    while True:
+        session = None
+        ws = None
+
+        try:
+            print("[Gate WS] Connecting...")
+
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None))
+            ws = await session.ws_connect(
+                GATE_WS, heartbeat=20, autoping=True,
+                headers={"X-Gate-Size-Decimal": "1"})
+
+            _gate_ws_ref["ws"] = ws
+            _gate_subscribed_symbols = set()
+            _ws_status['gate']['connected'] = True
+            print("[Gate WS] Connected!")
+
+            await _gate_subscribe_pending(ws, session)
+            last_sync = time.time()
+
+            while True:
+                now = time.time()
+                if now - last_sync > 15:
+                    await _gate_subscribe_pending(ws, session)
+                    last_sync = now
+
+                try:
+                    msg = await asyncio.wait_for(
+                        ws.receive(), timeout=5)
+                except asyncio.TimeoutError:
+                    continue
+
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                    except Exception:
+                        continue
+
+                    if data.get('channel') != GATE_LIQ_CHANNEL:
+                        continue
+
+                    event = data.get('event')
+                    if event in ('subscribe', 'unsubscribe'):
+                        err = data.get('error')
+                        if err:
+                            print(f"[Gate WS] sub err: {err}")
+                            # Ошибочные подписки повторим позже
+                            _gate_subscribed_symbols = set()
+                        else:
+                            print("[Gate WS] Sub OK")
+                        continue
+
+                    if event not in ('update', 'all', None):
+                        continue
+
+                    parsed = await _parse_gate_ws_events(
+                        session, data)
+                    if not parsed:
+                        continue
+
+                    async with _gate_ws_lock:
+                        _gate_ws_events.extend(parsed)
+                        cutoff = time.time() - _WS_BUFFER_TTL
+                        _gate_ws_events = [
+                            e for e in _gate_ws_events
+                            if e['time'] >= cutoff
+                        ]
+
+                    _ws_status['gate']['events'] += len(parsed)
+                    _ws_status['gate']['last_event_ts'] = time.time()
+
+                    for ev in parsed:
+                        if ev['usd_value'] >= 50000:
+                            print(
+                                f"[Gate WS] "
+                                f"{ev['symbol']} "
+                                f"{ev['direction']} "
+                                f"${ev['usd_value']:,.0f}")
+
+                elif msg.type in (
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.ERROR):
+                    print("[Gate WS] Lost")
+                    break
+
+        except asyncio.CancelledError:
+            print("[Gate WS] остановлен")
+            raise
+        except Exception as e:
+            print(f"[Gate WS] err: {e}")
+        finally:
+            _ws_status['gate']['connected'] = False
+            _gate_ws_ref["ws"] = None
+            try:
+                if ws and not ws.closed:
+                    await ws.close()
+            except Exception:
+                pass
+            try:
+                if session and not session.closed:
+                    await session.close()
+            except Exception:
+                pass
+
+        print("[Gate WS] Reconnect 5s...")
+        await asyncio.sleep(5)
+
+
+def ws_health() -> dict:
+    """Короткая диагностика WS-источников для статуса/логов."""
+    now = time.time()
+    out = {}
+    sizes = {
+        'bybit': len(_bybit_ws_events),
+        'binance': len(_binance_ws_events),
+        'gate': len(_gate_ws_events),
+    }
+    for name, st in _ws_status.items():
+        last = st.get('last_event_ts', 0)
+        out[name] = {
+            'connected': bool(st.get('connected')),
+            'events_total': int(st.get('events', 0)),
+            'buffered': sizes.get(name, 0),
+            'age_sec': (now - last) if last else None,
+        }
+    return out
 
 
 # ==================================================
@@ -953,6 +1396,10 @@ async def get_binance_liquidations(
 async def get_all_liquidations(
         session, base_symbol, min_usd=10000):
     base = base_symbol.replace('_USDT', '')
+
+    # Подстраховка: если монету не зарегистрировали заранее через
+    # set_symbols(), WS-источники всё равно на неё подпишутся.
+    ensure_symbol(base_symbol)
 
     results = await asyncio.gather(
         get_gate_liquidations(
