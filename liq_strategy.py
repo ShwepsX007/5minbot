@@ -1,27 +1,32 @@
 """
-Стратегия "Каскад ликвидаций" — улучшенная логика на основе другого бота.
+Стратегия "Каскад ликвидаций" для Polymarket Up/Down.
 
-Основные исправления относительно старой версии:
-  - Был баг: get_all_liquidations() возвращает только НОВЫЕ события (фильтр _last_seen),
-    а мы сразу агрегировали их по window_sec, теряя старые события окна.
-    Теперь ведём событийный буфер 600 сек как в другом боте: _events_buffer[symbol]
-  - Убран жёсткий фильтр по свече, который резал сигналы. Теперь candle используется
-    только для информации/слабого подтверждения, а не для блокировки сигнала.
-    Контр-трейд: LONG liquidation (лонги выбили вниз) → ставим UP, SHORT → DOWN
-  - Добавлены power_bar, OI и импакт % как в другом боте для красивых сообщений
-  - Сохраняем детальные последние ликвидации в settings для статуса
+ВХОД (нужны обе части — каскад и свеча):
+  1. Ловим ликвидации с Binance/Bybit/OKX/Gate (WS + публичный REST OKX),
+     копим событийный буфер 600с по каждой монете.
+  2. Агрегируем за liq_window_sec. Нужен total_usd >= liq_threshold_usd
+     и явное доминирование одной стороны.
+  3. Смотрим ПОСЛЕДНЮЮ ЗАВЕРШЁННУЮ свечу 5m (спот Gate.io — та же цена,
+     по которой Polymarket считает Up/Down):
+       свеча DOWN + ликвидируют ЛОНГОВ → входим UP  (контр-трейд)
+       свеча UP   + ликвидируют ШОРТОВ → входим DOWN
+     Если свеча и каскад смотрят в разные стороны — сигнал пропускаем.
+  4. Вход в СЛЕДУЮЩЕЕ окно, по рынку или лимиткой (liq_entry_mode).
 
-Принцип:
-  1. Слушаем ликвидации Gate+OKX+Bybit WS, копим 600с буфер
-  2. Агрегируем за окно (60с) → если total_usd > threshold и dominant != NEUTRAL → сигнал
-  3. Открываем Polymarket Up/Down на СЛЕДУЮЩЕМ окне
-  4. За liq_new_order_time секунд до конца окна досрочно закрываем позицию
-     (продаём по текущей лучшей цене) — чтобы не зависнуть от цены
-     в момент X.
-  5. Если проиграли — НЕ ждём нового каскада, а сразу ставим
-     следующий шаг мартингейла на СЛЕДУЮЩЕМ окне (5 мин) с
-     увеличенной ставкой. Мартингейл — это последовательность
-     по таймеру, а не по новым каскадам.
+ВЫХОД:
+  1. Достигнут liq_tp_cents → продаём (лимиткой на TP, а если позиция
+     меньше $5 — по рынку).
+  2. За liq_new_order_time секунд до конца окна смотрим свечу ТЕКУЩЕГО
+     окна, то есть где цена относительно старта рынка:
+       • идёт в нашу сторону → НЕ закрываемся досрочно, ждём расчёта
+         (раньше бот здесь сливал выигрышные позиции по 40¢);
+       • идёт против нас → шаг проигран: спасаем остаток продажей и
+         сразу открываем следующее окно в ТУ ЖЕ сторону с мартингейлом.
+  3. После конца окна итог определяем по закрытой свече этого окна
+     (с перепроверкой ценой рынка). Выигрыш — серия сброшена, проигрыш —
+     следующий шаг мартингейла в ту же сторону.
+
+Мартингейл идёт по таймеру внутри серии и не ждёт нового каскада.
 """
 
 import json
@@ -37,6 +42,47 @@ import liq_api
 from database import get_setting, set_setting, add_trade_history, get_trade_statistics
 
 log = logging.getLogger("bot.liq_strategy")
+
+
+_MD_SPECIALS = ("_", "*", "`", "[", "]")
+
+
+def md_escape(text) -> str:
+    """Экранирует спецсимволы Telegram Markdown в произвольной строке.
+
+    Без этого любой `BTC_USDT`, попавший в текст вне обратных кавычек
+    (например, в строке «Последняя проверка: [BTC_USDT] каскад …»),
+    открывает курсив, который никогда не закрывается, и Telegram
+    отвечает «Can't parse entities: can't find end of the entity».
+    """
+    out = str(text if text is not None else "")
+    for ch in _MD_SPECIALS:
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+
+async def _send(context, cid, text, **kwargs):
+    """Отправка сообщения с откатом на обычный текст.
+
+    Если в текст всё же просочилась битая Markdown-разметка, сообщение
+    уходит без форматирования, а не теряется целиком (раньше из-за этого
+    падал весь job и переставали работать кнопки стратегии).
+    """
+    kwargs.setdefault("parse_mode", "Markdown")
+    body = text if len(text) <= 4000 else text[:4000]
+    try:
+        return await context.bot.send_message(cid, body, **kwargs)
+    except Exception as e:
+        if "parse entities" not in str(e).lower():
+            log.warning(f"send err: {e}")
+            return None
+        log.warning(f"Markdown битый, шлю как текст: {e}")
+        kwargs.pop("parse_mode", None)
+        try:
+            return await context.bot.send_message(cid, body, **kwargs)
+        except Exception as e2:
+            log.warning(f"send plain err: {e2}")
+            return None
 
 GATE_BASE = liq_api.GATE_BASE
 
@@ -678,11 +724,11 @@ def get_status_text() -> str:
             # Серия идёт, открытых позиций нет — бот ждёт продолжения мартингейла
             extra = " Продолжение мартингейла разрешено по: " + ", ".join(f"`{s}`" for s in active_series_syms)
             lines.append(
-                f"🔒 *Стоп по чужим монетам*: {lock_reason}.{extra}"
+                f"🔒 *Стоп по чужим монетам*: {md_escape(lock_reason)}.{extra}"
             )
         else:
             lines.append(
-                f"🔒 *Глобальный СТОП по депозиту*: {lock_reason}. "
+                f"🔒 *Глобальный СТОП по депозиту*: {md_escape(lock_reason)}. "
                 f"Новых сделок не открываем ни по одной монете до закрытия текущего цикла."
             )
         lines.append("")
@@ -772,18 +818,18 @@ def get_status_text() -> str:
                 s_usd = ex.get("short_usd", 0)
                 l_cnt = ex.get("long_count", 0)
                 s_cnt = ex.get("short_count", 0)
-                lines.append(f"     • {ex_name}: ${l_usd+s_usd:,.0f} (L ${l_usd:,.0f} x{l_cnt} / S ${s_usd:,.0f} x{s_cnt})")
+                lines.append(f"     • {md_escape(ex_name)}: ${l_usd+s_usd:,.0f} (L ${l_usd:,.0f} x{l_cnt} / S ${s_usd:,.0f} x{s_cnt})")
             for ex_name, ex in by_ex.items():
                 if ex_name in ["Bybit", "Gate.io", "OKX"]:
                     continue
                 l_usd = ex.get("long_usd", 0)
                 s_usd = ex.get("short_usd", 0)
-                lines.append(f"     • {ex_name}: ${l_usd+s_usd:,.0f}")
+                lines.append(f"     • {md_escape(ex_name)}: ${l_usd+s_usd:,.0f}")
         lines.append("")
     else:
         last_scan = get_setting("liq_last_scan", "")
         if last_scan:
-            lines.append(f"🔎 Последняя проверка: {last_scan}")
+            lines.append(f"🔎 Последняя проверка: {md_escape(last_scan)}")
             lines.append("")
         elif last_check_ts_raw:
             try:
@@ -817,7 +863,7 @@ def get_status_text() -> str:
                 t = e.get("time", 0)
                 ago = _time_ago(t)
                 dir_emoji = "🔴 LONG→" if direction == "LONG" else "🟢 SHORT→" if direction == "SHORT" else direction
-                lines.append(f"     {dir_emoji} {ex} {_fmt_usd_compact(usd)} @ {price} ({ago})")
+                lines.append(f"     {dir_emoji} {md_escape(ex)} {_fmt_usd_compact(usd)} @ {price} ({ago})")
         if any_shown:
             lines.append("")
 
@@ -840,7 +886,7 @@ def get_status_text() -> str:
                     return "?"
             for tr in stats["recent"]:
                 pnl = float(tr.get("pnl", 0))
-                q = str(tr.get("question", ""))[:22]
+                q = md_escape(str(tr.get("question", ""))[:22])
                 outcome = tr.get("outcome", "?")
                 ts = float(tr.get("timestamp", 0))
                 ago = _time_ago(ts)
@@ -853,13 +899,224 @@ def get_status_text() -> str:
         lines.append(f"   (Режим {'ДЕМО' if is_demo_mode else 'РЕАЛ'})")
         lines.append("")
 
-    lines.append("💡 _Логика: пока по одной монете открыта позиция или идёт серия мартингейла, по другим монетам вход блокируется. Но **продолжение мартингейла по той же монете** разрешено — иначе серия оборвалась бы на втором шаге. Тип входа (рыночный/лимитный) задаётся в ⚙️ Настройках. Свеча для решения берётся со **спота Gate.io** — это та же цена, по которой Polymarket рассчитывает Up/Down._")
+    lines.append(
+        "💡 Пока по одной монете открыта позиция или идёт серия мартингейла, по другим "
+        "монетам вход блокируется — продолжение мартингейла по той же монете разрешено. "
+        "Вход по сигналу: свеча DOWN + ликвидации лонгов → UP, свеча UP + ликвидации "
+        "шортов → DOWN. Выход: по TP, либо держим до расчёта, если свеча идёт в нашу "
+        "сторону. Свеча берётся со спота Gate.io — это та же цена, по которой Polymarket "
+        "считает Up/Down."
+    )
     return "\n".join(lines)
 
 
 # ===================== СВЕЧА =====================
-# Кэш для спот-свечей, чтобы не ходить на API на каждом тике
-_spot_candle_cache: dict = {}  # key=(symbol,tf) -> {"ts": float, "open": float, "close": float, "src": str}
+# Кэш свечей, чтобы не ходить на API на каждом тике скана.
+# key=(symbol, interval) -> {"ts": float, "candles": [dict], "src": str}
+_spot_candle_cache: dict = {}
+_CANDLE_CACHE_TTL = 2.0
+
+# Порог «дожи»: движение меньше 0.005% считаем неопределённым.
+_DOJI_PCT = 0.00005
+
+# Порядок полей в ответе /spot/candlesticks Gate.io:
+#   [t, quote_volume, close, high, low, open, base_volume, window_closed]
+# (тот же порядок t,v,c,h,l,o, что и в WS-канале spot.candlesticks).
+# Раньше код читал row[2] как open и row[5] как close — то есть
+# open и close были ПЕРЕПУТАНЫ МЕСТАМИ, и направление свечи всегда
+# определялось наоборот. Это ломало весь контр-трейд.
+_SPOT_IDX = {"t": 0, "close": 2, "high": 3, "low": 4, "open": 5}
+
+# Автопроверка порядка полей: сравниваем close текущей свечи с last
+# из /spot/tickers. Если API когда-нибудь поменяет порядок — сами
+# это заметим и переключимся, а не будем молча торговать наоборот.
+_spot_order_checked = False
+
+
+async def _verify_spot_field_order(session, symbol: str, rows: list):
+    """Один раз за запуск сверяет close последней свечи с ценой из тикера."""
+    global _SPOT_IDX, _spot_order_checked
+    if _spot_order_checked or not rows:
+        return
+    _spot_order_checked = True
+    try:
+        data = await liq_api.fetch_json(
+            session, "https://api.gateio.ws/api/v4/spot/tickers",
+            params={"currency_pair": symbol},
+        )
+        if not data or not isinstance(data, list):
+            return
+        last = float(data[0].get("last") or 0)
+        if last <= 0:
+            return
+        row = rows[-1]
+        as_close = abs(float(row[2]) - last)
+        as_open = abs(float(row[5]) - last)
+        if as_open < as_close:
+            log.warning(
+                "liq: Gate.io поменял порядок полей свечи — "
+                "переключаюсь на open=row[2], close=row[5]"
+            )
+            _SPOT_IDX = {"t": 0, "open": 2, "high": 3, "low": 4, "close": 5}
+        else:
+            log.info("liq: порядок полей свечи Gate.io подтверждён (close=row[2], open=row[5])")
+    except Exception as e:
+        log.debug(f"spot field order check err: {e}")
+
+
+def _parse_spot_row(row, dur: int, now: float) -> dict | None:
+    """Строка массива /spot/candlesticks → словарь свечи."""
+    try:
+        t = float(row[_SPOT_IDX["t"]])
+        o = float(row[_SPOT_IDX["open"]])
+        c = float(row[_SPOT_IDX["close"]])
+        h = float(row[_SPOT_IDX["high"]])
+        low = float(row[_SPOT_IDX["low"]])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    if o <= 0 or c <= 0:
+        return None
+    closed = (t + dur) <= now
+    # У Gate.io в 8-м поле бывает флаг закрытия окна — он точнее часов.
+    try:
+        if len(row) >= 8:
+            flag = str(row[7]).lower()
+            if flag in ("true", "false"):
+                closed = flag == "true"
+    except Exception:
+        pass
+    return {"t": t, "open": o, "close": c, "high": h, "low": low,
+            "closed": closed, "src": "gateio_spot"}
+
+
+def _parse_fut_row(row, dur: int, now: float) -> dict | None:
+    """Свеча фьючерсов Gate.io — объект {t, v, c, h, l, o}."""
+    if not isinstance(row, dict):
+        return None
+    try:
+        t = float(row.get("t") or 0)
+        o = float(row.get("o") or 0)
+        c = float(row.get("c") or 0)
+        h = float(row.get("h") or o)
+        low = float(row.get("l") or o)
+    except (TypeError, ValueError):
+        return None
+    if o <= 0 or c <= 0:
+        return None
+    return {"t": t, "open": o, "close": c, "high": h, "low": low,
+            "closed": (t + dur) <= now, "src": "gateio_fut"}
+
+
+def candle_state(candle: dict | None) -> str | None:
+    """UP / DOWN / None (дожи) по одной свече.
+
+    Именно этим бот отвечает на вопрос «цена выше или ниже старта окна»:
+    open свечи 5m совпадает со стартом окна Polymarket Up/Down (обе сетки
+    выровнены по UTC), а close — это либо текущая цена (окно идёт), либо
+    цена на момент расчёта (окно закрыто).
+    """
+    if not candle:
+        return None
+    o = candle.get("open") or 0
+    c = candle.get("close") or 0
+    if o <= 0 or c <= 0:
+        return None
+    if abs(c - o) / o < _DOJI_PCT:
+        return None
+    return "UP" if c > o else "DOWN"
+
+
+async def get_candles(session, symbol: str, timeframe: str = "5m",
+                      limit: int = 5, force: bool = False) -> list:
+    """Свечи Gate.io SPOT (приоритет) или FUTURES (fallback), по возрастанию t.
+
+    Спот — та же цена, по которой Polymarket рассчитывает Up/Down,
+    поэтому решения бота совпадают с графиком рынка.
+    """
+    if not symbol or not symbol.endswith("_USDT"):
+        return []
+    interval = GATE_INTERVAL.get(timeframe, "5m")
+    dur = TF_SECONDS.get(timeframe, 300)
+    now = time.time()
+
+    cache_key = (symbol, interval)
+    cached = _spot_candle_cache.get(cache_key)
+    if (not force and cached and
+            (now - cached["ts"]) < _CANDLE_CACHE_TTL and
+            len(cached.get("candles") or []) >= min(limit, 2)):
+        return cached["candles"]
+
+    # 1. Gate.io SPOT
+    try:
+        data = await liq_api.fetch_json(
+            session, "https://api.gateio.ws/api/v4/spot/candlesticks",
+            params={"currency_pair": symbol, "interval": interval,
+                    "limit": max(limit, 3)},
+        )
+        if data and isinstance(data, list) and data:
+            await _verify_spot_field_order(session, symbol, data)
+            candles = [
+                x for x in (_parse_spot_row(r, dur, now) for r in data) if x
+            ]
+            if candles:
+                candles.sort(key=lambda x: x["t"])
+                _spot_candle_cache[cache_key] = {
+                    "ts": now, "candles": candles, "src": "gateio_spot"}
+                return candles
+    except Exception as e:
+        log.debug(f"gateio_spot candles err: {e}")
+
+    # 2. Fallback: Gate.io USDT-M FUTURES
+    try:
+        data = await liq_api.fetch_json(
+            session, f"{GATE_BASE}/candlesticks",
+            params={"contract": symbol, "interval": interval,
+                    "limit": max(limit, 3)},
+        )
+        if data and isinstance(data, list) and data:
+            candles = [
+                x for x in (_parse_fut_row(r, dur, now) for r in data) if x
+            ]
+            if candles:
+                candles.sort(key=lambda x: x["t"])
+                _spot_candle_cache[cache_key] = {
+                    "ts": now, "candles": candles, "src": "gateio_fut"}
+                return candles
+    except Exception as e:
+        log.debug(f"gateio_fut candles err: {e}")
+
+    return []
+
+
+async def get_prev_candle(session, symbol: str, timeframe: str = "5m") -> dict | None:
+    """Последняя ЗАВЕРШЁННАЯ свеча — на неё смотрим при входе по сигналу."""
+    candles = await get_candles(session, symbol, timeframe, limit=4)
+    for cndl in reversed(candles):
+        if cndl.get("closed"):
+            return cndl
+    # Флага закрытия нет — берём предпоследнюю (последняя ещё рисуется)
+    if len(candles) >= 2:
+        return candles[-2]
+    return None
+
+
+async def get_window_candle(session, symbol: str, timeframe: str,
+                            window_start: float, force: bool = False) -> dict | None:
+    """Свеча КОНКРЕТНОГО окна Polymarket (по времени старта окна).
+
+    Пока окно идёт — это «живая» свеча: её open = цена на старте рынка,
+    close = текущая цена. Так бот понимает, выше он старта или ниже.
+    После закрытия окна та же свеча даёт итог, по которому Polymarket
+    рассчитывает Up/Down.
+    """
+    if not window_start:
+        return None
+    candles = await get_candles(session, symbol, timeframe, limit=5, force=force)
+    target = int(window_start)
+    for cndl in candles:
+        if int(cndl["t"]) == target:
+            return cndl
+    return None
 
 
 async def get_candle_direction(
@@ -867,98 +1124,17 @@ async def get_candle_direction(
     symbol: str,
     timeframe: str = "5m",
 ):
-    """Определяет направление текущей 5m/15m/1h свечи для решения по сигналу.
+    """Направление последней ЗАВЕРШЁННОЙ свечи: "UP" / "DOWN" / None.
 
-    Раньше: брали свечу с Gate.io USDT-M FUTURES (/api/v4/futures/usdt/candlesticks).
-    Это фьючерсный рынок — цена расходится со спотом, особенно в моменты
-    ликвидационных каскадов. Из-за этого бот часто видел «свеча вниз» и
-    открывал UP, а Polymarket (на споте) показывал выигрышную свечу.
-    Теперь: берём спотовую цену с Gate.io Spot (/api/v4/spot/candlesticks).
-    Спотовая цена BTC = та, по которой Polymarket рассчитывает результат
-    Up/Down, поэтому решения бота теперь совпадают с графиком Polymarket.
-
-    Возвращает:
-        "UP"   — close > open (свеча зелёная, ставим DOWN как контр-трейд)
-        "DOWN" — close < open (свеча красная, ставим UP как контр-трейд)
-        None   — не удалось получить или свеча doji
-
-    Используем ПОСЛЕДНЮЮ ЗАВЕРШЁННУЮ свечу (не текущую, которая ещё рисуется).
-    Polymarket Up/Down окна синхронизированы с UTC-границами 0, 5, 10, 15, ...
-    минут, и закрытие окна совпадает с закрытием 5m-свечи.
+    Оставлено с прежней сигнатурой — используется при разборе сигнала
+    и в статусе.
     """
-    # Нормализуем символ: BTC_USDT -> BTC_USDT для Gate.io spot
-    if not symbol or not symbol.endswith("_USDT"):
-        return None
-    interval = GATE_INTERVAL.get(timeframe, "5m")
-
-    # Кэш: 2 секунды достаточно, чтобы не долбить API на каждом тике,
-    # но не настолько, чтобы устарело.
-    cache_key = (symbol, interval)
-    cached = _spot_candle_cache.get(cache_key)
-    if cached and (time.time() - cached["ts"]) < 2.0:
-        o, c = cached["open"], cached["close"]
-        return _compare_candle(o, c, source=cached.get("src"))
-
-    # 1. Пробуем Gate.io SPOT (приоритет)
-    try:
-        url = "https://api.gateio.ws/api/v4/spot/candlesticks"
-        data = await liq_api.fetch_json(
-            session, url,
-            params={"currency_pair": symbol, "interval": interval, "limit": 2}
-        )
-        if data and isinstance(data, list) and len(data) >= 2:
-            # Gate.io spot: [time_s, vol, open, high, low, close, ...]
-            # Последний элемент — текущая (ещё не закрытая) свеча.
-            # Берём предпоследнюю — она гарантированно завершена.
-            prev = data[-2]
-            o = float(prev[2])
-            c = float(prev[5])
-            _spot_candle_cache[cache_key] = {
-                "ts": time.time(), "open": o, "close": c, "src": "gateio_spot"
-            }
-            return _compare_candle(o, c, source="gateio_spot")
-    except Exception as e:
-        log.debug(f"gateio_spot candle err: {e}")
-
-    # 2. Fallback: Gate.io USDT-M FUTURES (старое поведение, на случай
-    # если спот endpoint временно недоступен). Здесь берём последнюю
-    # завершённую свечу по тому же принципу.
-    try:
-        url = f"{GATE_BASE}/candlesticks"
-        data = await liq_api.fetch_json(
-            session, url,
-            params={"contract": symbol, "interval": interval, "limit": 2}
-        )
-        if data and isinstance(data, list) and len(data) >= 2:
-            prev = data[-2]
-            o = float(prev[1])
-            c = float(prev[2])
-            _spot_candle_cache[cache_key] = {
-                "ts": time.time(), "open": o, "close": c, "src": "gateio_fut"
-            }
-            return _compare_candle(o, c, source="gateio_fut")
-    except Exception as e:
-        log.debug(f"gateio_fut candle err: {e}")
-
-    return None
+    return candle_state(await get_prev_candle(session, symbol, timeframe))
 
 
 def _compare_candle(open_price: float, close_price: float, source: str = "") -> str | None:
-    """Сравнивает open/close свечи и возвращает "UP"/"DOWN"/None.
-
-    None — когда разница меньше 0.005% (doji), чтобы бот не выбирал
-    сторону по неопределённой свече и не срабатывал на шум.
-    """
-    if open_price <= 0 or close_price <= 0:
-        return None
-    change_pct = abs(close_price - open_price) / open_price
-    if change_pct < 0.00005:  # doji (< 0.005% движения)
-        return None
-    if close_price > open_price:
-        return "UP"
-    if close_price < open_price:
-        return "DOWN"
-    return None
+    """Совместимость со старым кодом: сравнение open/close."""
+    return candle_state({"open": open_price, "close": close_price})
 
 
 # ===================== SLUG =====================
@@ -973,6 +1149,18 @@ def build_updown_slug(symbol: str, timeframe: str, now_ts: float, offset_windows
     dur_key = timeframe
     start, _ = _window_bounds(timeframe, now_ts, offset_windows)
     return f"{asset}-updown-{dur_key}-{start}"
+
+
+def pick_entry_window(timeframe: str, now_ts: float, min_left_ratio: float = 0.5) -> int:
+    """Какое окно брать для входа: 0 — текущее, 1 — следующее.
+
+    После расчёта рынка новое окно уже идёт несколько секунд, и заходить
+    в него нормально. А вот если от окна осталось меньше половины —
+    входить поздно, берём следующее.
+    """
+    dur = TF_SECONDS.get(timeframe, 300)
+    left = _window_bounds(timeframe, now_ts, 0)[1] - now_ts
+    return 0 if left >= dur * min_left_ratio else 1
 
 
 def seconds_left_in_window(timeframe: str, now_ts: float) -> float:
@@ -1129,21 +1317,40 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
         )
         return
 
-    # 5. Выбор стороны: контр-трейд по СВЕЧЕ.
-    # Свеча DOWN → ставим UP (ждём отскок вверх).
-    # Свеча UP → ставим DOWN (ждём откат вниз).
-    # Если свеча не определена (close == open) — fallback на старую
-    # логику: контр-трейд по доминирующей ликвидации.
-    if candle == "DOWN":
+    # 5. Выбор стороны: контр-трейд, но ТОЛЬКО при согласии свечи и каскада.
+    #
+    #   свеча DOWN + ликвидируют ЛОНГОВ  → цену продавили вниз → ставим UP
+    #   свеча UP   + ликвидируют ШОРТОВ  → цену вынесли вверх  → ставим DOWN
+    #
+    # Если свеча и каскад смотрят в разные стороны (например, свеча вниз,
+    # но выносят шортистов) — это не разворотная ситуация, а продолжение
+    # тренда. Раньше бот в таком случае всё равно входил против свечи и
+    # регулярно проигрывал. Теперь такой сигнал пропускается.
+    dominant = agg["dominant"]
+    if candle == "DOWN" and dominant == "LONG":
         outcome = "UP"
-        log.info(f"Signal {symbol} ${agg['total_usd']:.0f} candle DOWN ({candle_src}) → ставим UP")
-    elif candle == "UP":
+        log.info(f"Signal {symbol} ${agg['total_usd']:.0f} свеча DOWN + ликвидации LONG ({candle_src}) → UP")
+    elif candle == "UP" and dominant == "SHORT":
         outcome = "DOWN"
-        log.info(f"Signal {symbol} ${agg['total_usd']:.0f} candle UP ({candle_src}) → ставим DOWN")
+        log.info(f"Signal {symbol} ${agg['total_usd']:.0f} свеча UP + ликвидации SHORT ({candle_src}) → DOWN")
+    elif candle is None:
+        set_setting(
+            "liq_last_scan",
+            f"[{symbol}] каскад {dominant} ${agg['total_usd']:,.0f} — свеча нейтральна (дожи), вход пропущен",
+        )
+        log.info(f"Signal {symbol}: свеча дожи ({candle_src}) — пропускаю")
+        return
     else:
-        # Свеча нейтральна — fallback на ликвидации
-        outcome = "UP" if agg["dominant"] == "LONG" else "DOWN"
-        log.info(f"Signal {symbol} ${agg['total_usd']:.0f} candle={candle} ({candle_src}, fallback) → {outcome}")
+        set_setting(
+            "liq_last_scan",
+            f"[{symbol}] каскад {dominant} ${agg['total_usd']:,.0f} + свеча {candle} — "
+            f"нет разворотной связки, вход пропущен",
+        )
+        log.info(
+            f"Signal {symbol}: свеча {candle} и каскад {dominant} не совпали "
+            f"({candle_src}) — пропускаю"
+        )
+        return
 
     # Если вызвали с enter=False — только логируем каскад, сделку не открываем.
     # Используется, когда по этой монете стоп (например, она не в can_open_for),
@@ -1185,8 +1392,8 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
     if not info or not info.get("markets"):
         log.warning(f"liq_strategy: рынок {slug} не найден, пропускаю сигнал {symbol}")
         try:
-            await context.bot.send_message(
-                cid,
+            await _send(
+                context, cid,
                 f"⚠️ Рынок `{slug}` не найден на Polymarket (ещё не сгенерирован). Пропускаю сигнал `{symbol}` {outcome}.",
                 parse_mode="Markdown",
             )
@@ -1240,8 +1447,8 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
                 f"liq_strategy: лимитный вход {symbol} — ставка ${stake_usd} < ${min_size}, пропускаю"
             )
             try:
-                await context.bot.send_message(
-                    cid,
+                await _send(
+                    context, cid,
                     f"⚠️ Пропускаю `{symbol}`: лимитный вход требует ≥ ${min_size:.0f}, а у нас "
                     f"${stake_usd:.2f}. Переключи тип входа на «рыночный» в ⚙️ Настройках.",
                     parse_mode="Markdown",
@@ -1274,8 +1481,8 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
         if not order_ok:
             log.warning(f"liq_strategy: ордер не прошёл: {res}")
             try:
-                await context.bot.send_message(
-                    cid,
+                await _send(
+                    context, cid,
                     f"⚠️ Не удалось открыть сделку `{symbol}`: `{res}`",
                     parse_mode="Markdown",
                 )
@@ -1606,8 +1813,8 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
         except Exception:
             reply_markup = None
 
-        await context.bot.send_message(
-            cid, msg[:4000], parse_mode="Markdown",
+        await _send(
+            context, cid, msg[:4000], parse_mode="Markdown",
             reply_markup=reply_markup,
             disable_web_page_preview=True,
         )
@@ -1633,15 +1840,15 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
             if ex_str_fb:
                 msg_fb += f"📡 Биржи: {ex_str_fb}\n"
             msg_fb += f"🔗 [Polymarket]({poly_url})"
-            await context.bot.send_message(
-                cid, msg_fb[:4000],
+            await _send(
+                context, cid, msg_fb[:4000],
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
             )
         except Exception:
             try:
-                await context.bot.send_message(
-                    cid,
+                await _send(
+                    context, cid,
                     f"🚨 Сигнал {symbol} {agg.get('dominant','?')} ${agg.get('total_usd',0):,.0f} → {outcome} "
                     f"{stake_usd_final}$ @{entry_cents}¢ ({entry_mode}) серия {series}",
                 )
@@ -1650,25 +1857,33 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
 
 
 async def _check_open_position(context, cid, session, c, state, symbol, pos):
-    """Проверяет одну открытую позицию.
+    """Ведение одной открытой позиции.
 
-    TP-логика с учётом минимального размера ордера Polymarket ($5):
-    - На каждом тике последних ~60с окна тянем текущую цену.
-    - Если цена >= TP-цены:
-        * Если размер позиции * TP-цена >= $5 (min_size Polymarket):
-          → sell-LIMIT ровно на TP-цене (текущее поведение)
-        * Иначе (маленькая позиция, лимитку не поставишь):
-          → sell-MARKET по текущей цене (страховка — лучше сейчас,
-            чем застрять в позиции до конца окна)
-    - Если цена НЕ дошла до TP, и до конца окна осталось <=
-      liq_new_order_time сек — закрываем по рынку (страховка).
-    - Если цена < entry (убыток), и до конца <= liq_new_order_time —
-      закрываем по рынку (фиксируем убыток, не дожидаемся слива до 0).
+    Логика выхода (по ТЗ):
 
-    Возвращаемся к логике серии мартингейла: после sell фиксируем PnL
-    по фактической цене закрытия. WIN (close >= 50¢) — серия
-    сбрасывается. LOSS — серия увеличивается, и бот сразу входит в
-    следующее окно.
+    1. TP. Как только цена нашего исхода дошла до liq_tp_cents —
+       выходим: sell-LIMIT ровно на TP (если позиция ≥ $5) или
+       sell-MARKET (если меньше — лимитку Polymarket не примет).
+
+    2. За liq_new_order_time секунд до конца окна смотрим СОСТОЯНИЕ
+       ТЕКУЩЕЙ СВЕЧИ ЭТОГО ОКНА — выше она старта рынка или ниже
+       (open свечи 5m = цена на старте окна Polymarket):
+
+       • свеча идёт В НАШУ сторону, но TP не достигнут →
+         НИЧЕГО НЕ ДЕЛАЕМ. Досрочно не закрываемся, ждём полного
+         расчёта рынка. Раньше бот именно здесь и сливал: продавал
+         по 40-48¢ выигрышную позицию, которая через минуту
+         рассчиталась бы по 100¢.
+
+       • свеча идёт ПРОТИВ нас → шаг проигран. Спасаем остаток
+         (продаём по рынку, если получится) и сразу открываем
+         СЛЕДУЮЩЕЕ окно в ТУ ЖЕ сторону с мартингейлом.
+
+    3. После окончания окна (для удержанных позиций) ждём расчёта:
+       итог берём по закрытой свече этого окна (тот же спот Gate.io,
+       по которому считает Polymarket) с перепроверкой по цене рынка.
+       Выиграли — серия сбрасывается. Проиграли — следующий цикл
+       мартингейла в ту же сторону.
     """
     import polymarket_trading as pt
 
@@ -1683,6 +1898,13 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
 
     time_left = pos["window_end"] - now
     new_order_time = int(float(c.get("liq_new_order_time", "3")))
+
+    # Окно уже закрылось, а позиция всё ещё у нас — значит мы сознательно
+    # держали её до расчёта (свеча шла в нашу сторону). Ждём итог рынка.
+    if time_left <= 0:
+        await _resolve_after_window(context, cid, session, c, state, symbol, pos)
+        return
+
     try:
         tp_cents = int(float(c.get("liq_tp_cents", "90")))
     except Exception:
@@ -1701,15 +1923,11 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
     # Пора принимать решение. Тянем текущие цены с Polymarket.
     info = pt.get_event_markets(pos["slug"])
     if not info or not info.get("markets"):
-        # Не получили цены — подождём ещё немного, если есть время
-        if time_left > 0.5:
-            return
-        # Время вышло, выходим с PnL=0
-        log.warning(f"liq: {symbol} не получил цены, выхожу с PnL=0")
-        await _settle_position(context, cid, c, state, symbol, pos, win=False,
-                         close_price=0, price_yes=0, price_no=0,
-                         market_question=pos.get("slug", "?"),
-                         early_exit=True, settle_ts=now)
+        # Цен нет. Раньше бот в этом месте фиксировал PnL=0, то есть
+        # записывал проигрыш по сделке, которая могла и выиграть.
+        # Теперь просто дожидаемся окончания окна: _resolve_after_window
+        # определит итог по свече, а не по отсутствию котировки.
+        log.warning(f"liq: {symbol} нет цен по {pos['slug']} — жду расчёта окна")
         return
 
     m = info["markets"][0]
@@ -1771,8 +1989,8 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
                     state["positions"][symbol] = pos
                     _save_state(state)
                     try:
-                        await context.bot.send_message(
-                            cid,
+                        await _send(
+                            context, cid,
                             f"🎯 *TP {tp_cents}¢ достигнут!* `{symbol}` {pos['outcome']} @ {close_price}¢\n"
                             f"💰 Выставлен SELL-лимит на {tp_cents}¢ | ждём исполнения до конца окна\n",
                             parse_mode="Markdown",
@@ -1816,79 +2034,153 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
                 if time_left > 0.5:
                     return
 
-    # === Сценарий 2: убыток + мало времени → закрыть по рынку ===
-    # Не уходим в ноль, фиксируем убыток сейчас, иначе сольём всё.
-    if (not in_profit) and (emergency_time or close_price <= 0):
-        if is_demo_flag:
-            log.info(f"liq: 💥 {symbol} убыток (текущая {close_price}¢, вход {entry_cents}¢), "
-                     f"время {time_left:.1f}с — ДЕМО закрытие по рынку")
-            await _settle_position(context, cid, c, state, symbol, pos, win=False,
-                             close_price=close_price, price_yes=price_yes,
-                             price_no=price_no, market_question=market_question,
-                             early_exit=True, settle_ts=now)
+    # === Сценарий 2: подошли к концу окна — решаем по СВЕЧЕ ===
+    # Ключевое отличие от старой версии: сам по себе «убыток по цене
+    # Polymarket» больше НЕ повод закрываться. Смотрим, где цена монеты
+    # относительно старта окна — именно это определяет расчёт рынка.
+    if emergency_time:
+        window_start = pos.get("window_start") or (pos["window_end"] - TF_SECONDS.get(c["liq_timeframe"], 300))
+        wc = await get_window_candle(session, symbol, c["liq_timeframe"],
+                                     window_start, force=True)
+        state_now = candle_state(wc)
+        pos["last_candle_state"] = state_now or "FLAT"
+        delta_pct = 0.0
+        if wc and wc.get("open"):
+            delta_pct = (wc["close"] - wc["open"]) / wc["open"] * 100
+
+        # --- 2a. Свеча в нашу сторону → держим до расчёта ---
+        if state_now and state_now == pos["outcome"]:
+            if not pos.get("hold_notified"):
+                pos["hold_notified"] = 1
+                log.info(
+                    f"liq: 🤝 {symbol} свеча {state_now} совпадает с нашим "
+                    f"{pos['outcome']} ({delta_pct:+.3f}% от старта окна), "
+                    f"TP {tp_cents}¢ не достигнут — НЕ закрываю, жду расчёта"
+                )
+                await _send(
+                    context, cid,
+                    f"🤝 *Держим до расчёта* `{symbol}` {pos['outcome']}\n"
+                    f"📈 Свеча окна: *{state_now}* ({delta_pct:+.3f}% от старта) — идёт в нашу сторону\n"
+                    f"💵 Цена {close_price}¢ (вход {entry_cents}¢), TP {tp_cents}¢ не достигнут\n"
+                    f"⏳ Досрочно не продаём: при таком закрытии окна выплата 100¢",
+                )
+            pos["hold_to_resolution"] = 1
+            state["positions"][symbol] = pos
+            _save_state(state)
             return
-        # Реал: продаём по текущей лучшей цене
-        sell_price = max(0.01, min(0.99, max(1, min(99, close_price)) / 100.0))
-        try:
-            res = pt.place_order(pos["token_id"], "SELL", sell_price, shares)
-            if not (isinstance(res, dict) and not res.get("error")):
-                log.warning(f"liq: {symbol} loss-sell не прошёл: {res}")
-                if time_left > 0.3:
-                    return
-        except Exception as e:
-            log.warning(f"liq: {symbol} loss-sell exception: {e}")
-            if time_left > 0.3:
-                return
-        win = close_price >= 50
-        log.info(f"liq: 💥 {symbol} УБЫТОК закрыт по {close_price}¢ → "
-                 f"{'WIN' if win else 'LOSS'} (ставка {pos['stake']}$ серия {pos.get('series',0)})")
-        await _settle_position(context, cid, c, state, symbol, pos, win=win,
-                         close_price=close_price, price_yes=price_yes,
-                         price_no=price_no, market_question=market_question,
-                         early_exit=True, settle_ts=now)
+
+        # --- 2b. Свеча против нас (или дожи) → шаг проигран ---
+        # Спасаем что можно и сразу идём в следующее окно в ТУ ЖЕ сторону.
+        state_txt = state_now or "FLAT (дожи)"
+        log.info(
+            f"liq: ❌ {symbol} свеча окна {state_txt} против нашего "
+            f"{pos['outcome']} ({delta_pct:+.3f}%) — фиксирую шаг и иду в следующее окно"
+        )
+
+        salvage_price = 0
+        if not is_demo_flag and close_price > 0:
+            # Пытаемся продать остаток — это лучше, чем дать позиции
+            # обнулиться при расчёте. Если не вышло, не страшно.
+            sell_price = max(0.01, min(0.99, max(1, min(99, close_price)) / 100.0))
+            try:
+                res = pt.place_order(pos["token_id"], "SELL", sell_price, shares)
+                if isinstance(res, dict) and not res.get("error"):
+                    salvage_price = close_price
+                    log.info(f"liq: {symbol} остаток продан по {close_price}¢")
+                else:
+                    log.warning(f"liq: {symbol} salvage-sell не прошёл: {res}")
+            except Exception as e:
+                log.warning(f"liq: {symbol} salvage-sell exception: {e}")
+        elif is_demo_flag:
+            salvage_price = close_price
+
+        await _settle_position(context, cid, c, state, symbol, pos, win=False,
+                               close_price=salvage_price, price_yes=price_yes,
+                               price_no=price_no, market_question=market_question,
+                               early_exit=True, settle_ts=now,
+                               reason=f"свеча окна {state_txt} против {pos['outcome']}")
         return
 
-    # === Сценарий 3: прибыль, но TP не достигнут + мало времени → страховка ===
-    # До конца осталось <= new_order_time, а TP-лимитка ещё не выставлена
-    # (или цена так и не дошла до TP) — закрываем по рынку, чтобы получить
-    # хоть какую-то прибыль.
-    if in_profit and emergency_time:
-        if is_demo_flag:
-            log.info(f"liq: ⏰ {symbol} мало времени, прибыль {close_price}¢ > {entry_cents}¢, "
-                     f"TP {tp_cents}¢ не достигнут — ДЕМО закрытие по рынку")
-            await _settle_position(context, cid, c, state, symbol, pos, win=True,
-                             close_price=close_price, price_yes=price_yes,
-                             price_no=price_no, market_question=market_question,
-                             early_exit=True, settle_ts=now)
-            return
-        sell_price = max(0.01, min(0.99, max(1, min(99, close_price)) / 100.0))
-        try:
-            res = pt.place_order(pos["token_id"], "SELL", sell_price, shares)
-            if not (isinstance(res, dict) and not res.get("error")):
-                log.warning(f"liq: {symbol} profit-sell не прошёл: {res}")
-                if time_left > 0.3:
-                    return
-        except Exception as e:
-            log.warning(f"liq: {symbol} profit-sell exception: {e}")
-            if time_left > 0.3:
-                return
-        win = close_price >= 50
-        log.info(f"liq: ⏰ {symbol} страховка-закрытие по {close_price}¢ → "
-                 f"{'WIN' if win else 'LOSS'} (ставка {pos['stake']}$ серия {pos.get('series',0)})")
-        await _settle_position(context, cid, c, state, symbol, pos, win=win,
-                         close_price=close_price, price_yes=price_yes,
-                         price_no=price_no, market_question=market_question,
-                         early_exit=True, settle_ts=now)
-        return
-
-    # Не наш сценарий — цена пока между входом и TP, времени ещё достаточно.
+    # Не наш сценарий — цена между входом и TP, времени ещё достаточно.
     # Ждём следующего тика.
     return
 
 
+async def _resolve_after_window(context, cid, session, c, state, symbol, pos):
+    """Расчёт позиции, которую держали до конца окна.
+
+    Итог определяем по ЗАКРЫТОЙ свече этого окна на споте Gate.io —
+    это тот же источник цены, по которому Polymarket рассчитывает
+    Up/Down. Дополнительно перепроверяем ценой самого рынка: после
+    расчёта выигравший исход стоит ~100¢, проигравший ~0¢.
+    """
+    import polymarket_trading as pt
+
+    now = time.time()
+    tf = c["liq_timeframe"]
+    dur = TF_SECONDS.get(tf, 300)
+    window_start = pos.get("window_start") or (pos["window_end"] - dur)
+    outcome = pos["outcome"]
+    waited = now - pos["window_end"]
+
+    # 1. Свеча окна — ждём, пока она отметится закрытой
+    wc = await get_window_candle(session, symbol, tf, window_start, force=True)
+    result = candle_state(wc) if (wc and wc.get("closed")) else None
+    source = "свеча окна"
+
+    # 2. Перепроверка/фолбэк по цене Polymarket
+    price_yes = price_no = 0
+    market_question = pos.get("market_question_raw") or pos["slug"]
+    try:
+        info = pt.get_event_markets(pos["slug"])
+        if info and info.get("markets"):
+            m = info["markets"][0]
+            market_question = m.get("question", market_question)
+            price_yes = m.get("price_yes") or 0
+            price_no = m.get("price_no") or 0
+    except Exception as e:
+        log.debug(f"resolve price fetch err: {e}")
+
+    our_price = price_yes if outcome == "UP" else price_no
+    market_decided = our_price >= 97 or (our_price <= 3 and (price_yes or price_no))
+
+    if result is None and market_decided:
+        result = outcome if our_price >= 97 else ("DOWN" if outcome == "UP" else "UP")
+        source = "цена рынка"
+
+    if result is None:
+        # Ещё нет данных. Ждём до 3 минут, потом решаем по цене.
+        if waited < 180:
+            pos["awaiting_resolution"] = 1
+            state["positions"][symbol] = pos
+            _save_state(state)
+            set_setting(
+                "liq_last_scan",
+                f"[{symbol}] окно закрыто, жду расчёта ({int(waited)}с)",
+            )
+            return
+        result = outcome if our_price >= 50 else ("DOWN" if outcome == "UP" else "UP")
+        source = "фолбэк по цене"
+
+    win = (result == outcome)
+    # Выиграли — доли гасятся по 100¢; проиграли — по 0¢.
+    close_price = 100 if win else 0
+    log.info(
+        f"liq: 🏁 {symbol} окно рассчитано: {result} ({source}), "
+        f"наш {outcome} → {'WIN' if win else 'LOSS'}"
+    )
+
+    await _settle_position(context, cid, c, state, symbol, pos, win=win,
+                           close_price=close_price, price_yes=price_yes,
+                           price_no=price_no, market_question=market_question,
+                           early_exit=False, settle_ts=now,
+                           reason=f"расчёт окна: {result} ({source})")
+
+
 async def _settle_position(context, cid, c, state, symbol, pos, *,
                      win: bool, close_price: int, price_yes: int, price_no: int,
-                     market_question: str, early_exit: bool, settle_ts: float):
+                     market_question: str, early_exit: bool, settle_ts: float,
+                     reason: str = ""):
     """Общая логика закрытия позиции: фиксация PnL, обновление серии,
     при проигрыше — запуск следующего шага мартингейла в новом окне.
 
@@ -1931,17 +2223,22 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
                 f"🎯 {outcome} закрыт по {close_price}¢ (вход {entry_cents}¢)\n"
                 f"💵 {stake}$ → +{pnl}$ | Серия {current_series}→0/{max_series}\n"
                 f"💥 Каскад на входе: {agg_snap.get('dominant','?')} ${agg_snap.get('total_usd',0):,.0f}\n"
+                + (f"🧭 {md_escape(reason)}\n" if reason else "")
+                +
                 f"📊 Всего {stats_after['total']} WR {stats_after['winrate']}% PnL {stats_after['total_pnl']}$\n"
             )
-            await context.bot.send_message(cid, msg[:4000], parse_mode="Markdown")
+            await _send(context, cid, msg[:4000], parse_mode="Markdown")
         except Exception as e:
             log.warning(f"settle win msg err: {e}")
         return
 
     # === Проигрыш ===
-    pnl = -stake
+    # Если остаток удалось продать (salvage), убыток меньше полной ставки.
+    shares_cnt = pos.get("shares", stake) or 0
+    recovered = round(shares_cnt * (max(0, close_price) / 100.0), 2)
+    pnl = round(recovered - stake, 2)
     add_trade_history(is_demo_flag, slug, trade_question, outcome, "BUY",
-                      pos.get("shares", stake), entry_cents, 0, pnl)
+                      shares_cnt, entry_cents, close_price, pnl)
 
     next_series = current_series + 1
 
@@ -1963,7 +2260,7 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
                 f"📊 Всего {stats_after['total']} WR {stats_after['winrate']}% PnL {stats_after['total_pnl']}$\n"
                 f"Жду новый каскад по `{symbol}`"
             )
-            await context.bot.send_message(cid, msg[:4000], parse_mode="Markdown")
+            await _send(context, cid, msg[:4000], parse_mode="Markdown")
         except Exception as e:
             log.warning(f"settle series_bust msg err: {e}")
         return
@@ -1993,10 +2290,12 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
             f"📈 `{slug}` {outcome} закрыт по {close_price}¢ (вход {entry_cents}¢)\n"
             f"💵 {stake}$ → {pnl}$ | Серия {current_series}→{next_series}/{max_series}\n"
             f"♻️ След: {next_stake}$ ×{c_mult} @ {entry_cents}¢ (потенциал +{next_potential}$)\n"
+            + (f"🧭 {md_escape(reason)}\n" if reason else "")
+            +
             f"📊 {stats_after['total']} WR {stats_after['winrate']}% PnL {stats_after['total_pnl']}$\n"
             f"⏳ Сейчас вхожу в следующее окно с увеличенной ставкой…\n"
         )
-        await context.bot.send_message(cid, msg[:4000], parse_mode="Markdown")
+        await _send(context, cid, msg[:4000], parse_mode="Markdown")
     except Exception as e:
         log.warning(f"settle step_loss msg err: {e}")
 
@@ -2008,7 +2307,8 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     # Так как мы закрываемся в конце текущего окна, текущий
     # boundary уже истёк — следующее окно = (now // 5m + 1) * 5m.
     tf = c["liq_timeframe"]
-    next_window_start, next_window_end = _window_bounds(tf, settle_ts, offset_windows=1)
+    next_offset = pick_entry_window(tf, settle_ts)
+    next_window_start, next_window_end = _window_bounds(tf, settle_ts, offset_windows=next_offset)
     log.info(f"liq: 🪟 {symbol} следующее окно {datetime.fromtimestamp(next_window_start, tz=timezone.utc).strftime('%H:%M:%S UTC')} → "
              f"{datetime.fromtimestamp(next_window_end, tz=timezone.utc).strftime('%H:%M:%S UTC')}")
 
@@ -2023,8 +2323,8 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     except Exception as e:
         log.exception(f"martingale step enter err: {e}")
         try:
-            await context.bot.send_message(
-                cid, f"❌ Не удалось войти в следующее окно `{symbol}`: `{e}`",
+            await _send(
+                context, cid, f"❌ Не удалось войти в следующее окно `{symbol}`: `{e}`",
                 parse_mode="Markdown",
             )
         except Exception:
@@ -2048,10 +2348,16 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
     import polymarket_trading as pt
 
     now = time.time()
-    # Следующее окно — boundary после текущего момента
-    _, window_end = _window_bounds(tf, now, offset_windows=1)
-    start_next, _ = _window_bounds(tf, now, offset_windows=1)
-    slug = build_updown_slug(symbol, tf, now, offset_windows=1)
+    # Если текущее окно только началось (например, мы дождались расчёта
+    # предыдущего) — заходим в него, иначе ждём следующее.
+    offset = pick_entry_window(tf, now)
+    start_next, window_end = _window_bounds(tf, now, offset_windows=offset)
+    slug = build_updown_slug(symbol, tf, now, offset_windows=offset)
+    log.info(
+        f"liq: мартингейл {symbol} — окно "
+        f"{datetime.fromtimestamp(start_next, tz=timezone.utc).strftime('%H:%M:%S UTC')} "
+        f"(offset {offset}, осталось {int(window_end - now)}с)"
+    )
 
     # Outcome: сначала берём явно переданный, иначе fallback
     outcome = carried_outcome or "UP"
@@ -2076,8 +2382,8 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
     if not info or not info.get("markets"):
         log.error(f"liq: {symbol} рынок {slug} так и не появился")
         try:
-            await context.bot.send_message(
-                cid, f"❌ Мартингейл `{symbol}` (шаг {series}): рынок `{slug}` не появился. Серия прервана.",
+            await _send(
+                context, cid, f"❌ Мартингейл `{symbol}` (шаг {series}): рынок `{slug}` не появился. Серия прервана.",
                 parse_mode="Markdown")
         except Exception:
             pass
@@ -2105,8 +2411,8 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
         if stake_usd < min_size and stake_usd < POLY_MIN_ORDER_USD:
             log.warning(f"liq: мартингейл {symbol} — ставка ${stake_usd} < ${min_size}, не вхожу")
             try:
-                await context.bot.send_message(
-                    cid, f"⚠️ Мартингейл `{symbol}` (шаг {series}): лимитный вход требует ≥ ${min_size:.0f}, "
+                await _send(
+                    context, cid, f"⚠️ Мартингейл `{symbol}` (шаг {series}): лимитный вход требует ≥ ${min_size:.0f}, "
                          f"у нас ${stake_usd:.2f}. Переключи тип входа на «рыночный».",
                     parse_mode="Markdown")
             except Exception:
@@ -2127,8 +2433,8 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
         if not order_ok:
             log.warning(f"liq: мартингейл {symbol} — ордер не прошёл: {res}")
             try:
-                await context.bot.send_message(
-                    cid, f"❌ Мартингейл `{symbol}` (шаг {series}): ордер не прошёл — `{res}`",
+                await _send(
+                    context, cid, f"❌ Мартингейл `{symbol}` (шаг {series}): ордер не прошёл — `{res}`",
                     parse_mode="Markdown")
             except Exception:
                 pass
@@ -2164,6 +2470,6 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
             f"💵 Ставка: *{stake_usd_final}$* ({shares} shares)\n"
             f"🕐 Окно до: {next_window_end_str}\n"
         )
-        await context.bot.send_message(cid, msg[:4000], parse_mode="Markdown")
+        await _send(context, cid, msg[:4000], parse_mode="Markdown")
     except Exception as e:
         log.warning(f"martingale step msg err: {e}")

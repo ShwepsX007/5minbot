@@ -16,6 +16,49 @@ import liq_menu
 from config import BASE_DIR, ADMIN_CHAT_IDS
 
 log = logging.getLogger("bot")
+
+
+async def md_edit(q, text, **kwargs):
+    """edit_message_text с откатом на обычный текст.
+
+    Если в статус попала битая Markdown-разметка (например, `BTC_USDT`
+    вне обратных кавычек), Telegram отвечает «Can't parse entities», и
+    раньше исключение уходило наверх — кнопки стратегии переставали
+    отвечать. Теперь сообщение просто уходит без форматирования.
+    """
+    kwargs.setdefault("parse_mode", "Markdown")
+    try:
+        return await q.edit_message_text(text, **kwargs)
+    except BadRequest as e:
+        low = str(e).lower()
+        if "not modified" in low:
+            return None
+        if "parse entities" not in low:
+            raise
+        log.warning(f"Markdown битый, показываю без разметки: {e}")
+        kwargs.pop("parse_mode", None)
+        try:
+            return await q.edit_message_text(text, **kwargs)
+        except BadRequest as e2:
+            log.warning(f"plain edit err: {e2}")
+            return None
+
+
+async def md_reply(message, text, **kwargs):
+    """reply_text с тем же откатом на обычный текст."""
+    kwargs.setdefault("parse_mode", "Markdown")
+    try:
+        return await message.reply_text(text, **kwargs)
+    except BadRequest as e:
+        if "parse entities" not in str(e).lower():
+            raise
+        log.warning(f"Markdown битый, показываю без разметки: {e}")
+        kwargs.pop("parse_mode", None)
+        try:
+            return await message.reply_text(text, **kwargs)
+        except BadRequest as e2:
+            log.warning(f"plain reply err: {e2}")
+            return None
 user_state = {}
 
 
@@ -146,9 +189,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt = ls.get_status_text()
             if len(txt) > 3800:
                 txt = txt[:3800] + "\n\n_...обрезано_"
-            return await update.message.reply_text(
-                "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt,
-                parse_mode="Markdown", reply_markup=liq_menu.strat_menu_kb()
+            return await md_reply(
+                update.message, "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt,
+                reply_markup=liq_menu.strat_menu_kb()
             )
 
         if text == "⚙️ Настройки":
@@ -341,7 +384,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Telegram limit 4096, keep safe margin for markup
             if len(txt) > 3800:
                 txt = txt[:3800] + "\n\n_...обрезано, полный статус в логах_"
-            return await q.edit_message_text("🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt, parse_mode="Markdown", reply_markup=liq_menu.strat_menu_kb())
+            return await md_edit(q, "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt, reply_markup=liq_menu.strat_menu_kb())
 
         if d == "liq_toggle":
             s["state"] = None
@@ -351,7 +394,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt = ls.get_status_text()
             if len(txt) > 3800:
                 txt = txt[:3800] + "\n\n_...обрезано_"
-            return await q.edit_message_text("🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt, parse_mode="Markdown", reply_markup=liq_menu.strat_menu_kb())
+            return await md_edit(q, "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt, reply_markup=liq_menu.strat_menu_kb())
 
         if d == "liq_status":
             s["state"] = None
@@ -361,9 +404,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 txt = txt[:3800] + "\n\n_...обрезано_"
             # Reply instead of editing the unchanged menu: Telegram rejects an
             # identical edit with HTTP 400, which made Status appear unresponsive.
-            return await q.message.reply_text(
-                "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt,
-                parse_mode="Markdown", reply_markup=liq_menu.strat_menu_kb()
+            return await md_reply(
+                q.message, "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt,
+                reply_markup=liq_menu.strat_menu_kb()
             )
 
         if d == "liq_reset":
@@ -373,7 +416,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt = ls.get_status_text()
             if len(txt) > 3800:
                 txt = txt[:3800] + "\n\n_...обрезано_"
-            return await q.edit_message_text("✅ Серия сброшена.\n\n" + txt, parse_mode="Markdown", reply_markup=liq_menu.strat_menu_kb())
+            return await md_edit(q, "✅ Серия сброшена.\n\n" + txt, reply_markup=liq_menu.strat_menu_kb())
 
         if d == "liq_settings":
             s["state"] = None
