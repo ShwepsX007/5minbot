@@ -364,11 +364,22 @@ def get_market_info(token_id) -> Optional[dict]:
         data = r.json()
         if isinstance(data, list) and data:
             m = data[0]
+            # ВАЖНО: orderMinSize — это минимум в ДОЛЯХ (shares), а не в
+            # долларах. Обычно 5 shares: при цене 50¢ это $2.50, при 20¢ —
+            # $1.00. Раньше это значение трактовалось как «минимум $5», из-за
+            # чего расчёты размера ордера были неверными.
+            min_shares = float(m.get("orderMinSize", 5) or 5)
+            try:
+                tick = float(m.get("orderPriceMinTickSize", 0.01) or 0.01)
+            except (TypeError, ValueError):
+                tick = 0.01
             return {
                 "neg_risk": m.get("negRisk", False),
                 "accepting_orders": m.get("acceptingOrders", False),
                 "closed": m.get("closed", True),
-                "min_size": float(m.get("orderMinSize", 5)),
+                "min_size": min_shares,      # оставлено для совместимости
+                "min_shares": min_shares,
+                "tick_size": tick,
             }
         return None
     except Exception as e:
@@ -535,7 +546,17 @@ def _post_order_with_client(client, token_id, side: str, price: float, size: flo
 # TRADING
 # =========================================================
 
-def place_order(token_id, side: str, price: float, size: float) -> dict:
+def place_order(token_id, side: str, price: float, size: float,
+                allow_min_bump: bool = True) -> dict:
+    """Отправка ордера.
+
+    allow_min_bump=True  — если размер меньше минимума рынка, поднять его
+                           до минимума (поведение ручной торговли из меню).
+    allow_min_bump=False — вернуть ошибку, не трогая размер. Так делает
+                           стратегия: молчаливое увеличение лота превращало
+                           ставку в $1 в реальную покупку на $2.50
+                           (5 shares × 50¢) и ломало мартингейл и учёт PnL.
+    """
     global _client
 
     try:
@@ -557,9 +578,26 @@ def place_order(token_id, side: str, price: float, size: float) -> dict:
         if market_info:
             if not market_info["accepting_orders"]:
                 return {"error": "Market is closed or resolved"}
-            if size < market_info["min_size"]:
-                size = market_info["min_size"]
-                log.info(f"Size adjusted to minimum: {size}")
+            min_shares = float(market_info.get("min_shares")
+                               or market_info.get("min_size") or 0)
+            if min_shares > 0 and size < min_shares:
+                if not allow_min_bump:
+                    log.warning(
+                        f"Order rejected locally: size {size} < min {min_shares} shares"
+                    )
+                    return {
+                        "error": (
+                            f"размер {size} долей меньше минимума рынка "
+                            f"{min_shares:g} (это ~${min_shares * price:.2f})"
+                        ),
+                        "code": "below_min_size",
+                        "min_shares": min_shares,
+                        "requested_size": size,
+                        "min_cost_usd": round(min_shares * price, 2),
+                    }
+                size = min_shares
+                log.info(f"Size adjusted to minimum: {size} shares "
+                         f"(~${size * price:.2f})")
 
         log.info(f"Placing order: {side} {size}@{price} | token={token_id}")
 

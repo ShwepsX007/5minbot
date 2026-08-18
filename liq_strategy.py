@@ -110,12 +110,24 @@ DEFAULTS = {
     # Сколько последних сделок показывать в блоке «Последние сделки» статуса.
     "liq_recent_count":  "20",
     # Тип входа: "market" (по текущей лучшей цене) или "limit" (по entry_price_cents).
-    # Лимитный ордер на Polymarket требует минимум $5 — рыночный позволяет заходить мелкими лотами.
     "liq_entry_mode":    "market",
+    # Что делать, если заданный лот меньше минимального ордера рынка
+    # (Polymarket: обычно 5 shares, то есть ~$2.50 при цене 50¢):
+    #   "skip" — не входить и написать, какой лот нужен (по умолчанию);
+    #   "bump" — войти минимально возможным размером рынка.
+    "liq_min_size_mode": "skip",
 }
 
-# Минимально допустимый размер ордера на Polymarket CLOB. Используем для защиты от
-# ситуаций, когда бот хочет открыть сделку на сумму ниже этого порога.
+MIN_SIZE_MODES = ("skip", "bump")
+
+# Минимум ордера на Polymarket CLOB задаётся в ДОЛЯХ (shares), а не в
+# долларах: обычно 5 shares. В деньгах это зависит от цены — 5 shares по
+# 50¢ = $2.50, по 20¢ = $1.00. Раньше константа трактовалась как «минимум
+# $5», из-за чего размер лота считался неверно.
+POLY_MIN_ORDER_SHARES = 5.0
+# Дополнительный порог по сумме ордера (CLOB не принимает совсем мелочь).
+POLY_MIN_NOTIONAL_USD = 1.0
+# Оставлено для обратной совместимости со старым кодом/настройками.
 POLY_MIN_ORDER_USD = 5.0
 
 # Режимы входа (для валидации и UI).
@@ -368,6 +380,54 @@ def has_open_position(symbol: str) -> bool:
 
 def get_series(symbol: str) -> int:
     return int((_load_state().get("series") or {}).get(symbol, 0) or 0)
+
+
+def get_min_size_mode() -> str:
+    """skip — пропускать вход, если лот меньше минимума рынка; bump — доливать."""
+    v = str(get_setting("liq_min_size_mode", DEFAULTS["liq_min_size_mode"]) or "").strip().lower()
+    return v if v in MIN_SIZE_MODES else "skip"
+
+
+def plan_order(stake_usd: float, entry_cents: int, market_info: dict | None) -> dict:
+    """Считает реальный размер ордера с учётом минимума рынка.
+
+    Минимум Polymarket задан в ДОЛЯХ (обычно 5 shares), поэтому в деньгах
+    он зависит от цены: 5 shares по 50¢ = $2.50, по 20¢ = $1.00.
+
+    Возвращает словарь:
+      shares      — сколько долей реально отправим,
+      cost        — во сколько это обойдётся в $,
+      min_shares  — минимум рынка в долях,
+      min_cost    — тот же минимум в долларах по цене входа,
+      below_min   — правда ли, что заданный лот меньше минимума,
+      bumped      — подняли ли размер до минимума.
+    """
+    price = max(0.01, min(0.99, entry_cents / 100.0))
+    min_shares = 0.0
+    if market_info:
+        try:
+            min_shares = float(market_info.get("min_shares")
+                               or market_info.get("min_size") or 0)
+        except (TypeError, ValueError):
+            min_shares = 0.0
+    if min_shares <= 0:
+        min_shares = POLY_MIN_ORDER_SHARES
+
+    # Минимум по сумме ордера — тоже учитываем.
+    min_shares = max(min_shares, POLY_MIN_NOTIONAL_USD / price)
+
+    want_shares = stake_usd / price
+    below_min = want_shares < min_shares
+    shares = min_shares if below_min else want_shares
+    return {
+        "shares": round(shares, 4),
+        "cost": round(shares * price, 2),
+        "min_shares": round(min_shares, 4),
+        "min_cost": round(min_shares * price, 2),
+        "want_shares": round(want_shares, 4),
+        "below_min": below_min,
+        "bumped": False,
+    }
 
 
 def get_entry_mode() -> str:
@@ -704,7 +764,10 @@ def get_status_text() -> str:
     entry_mode_pretty = "🚀 Рыночный (по лучшей цене)" if entry_mode == "market" else "📋 Лимитный (по цене из настроек)"
     lines.append(f"🎯 Тип входа: *{entry_mode_pretty}*")
     lines.append(f"💥 Порог: *${float(c['liq_threshold_usd']):,.0f}* | 🪟 Окно: *{c['liq_window_sec']}с* (буфер 600с) | 🔎 Мин.ликв: *${c['liq_min_size_usd']}*")
+    min_mode_txt = ("⏭ пропускать вход" if get_min_size_mode() == "skip"
+                    else "⬆️ заходить минимумом рынка")
     lines.append(f"💵 Лот: *{c['liq_base_stake']}$* | ✖️ Мартин: *x{c['liq_martingale_mult']}* | 🎯 Лимит-цена: *{c['liq_entry_price_cents']}¢* | 🧮 Макс.серия: *{c['liq_max_series']}*")
+    lines.append(f"🚧 Если лот меньше минимума рынка (5 долей, ~${0.05 * float(c['liq_entry_price_cents']):.2f} при {c['liq_entry_price_cents']}¢): *{min_mode_txt}*")
     lines.append(f"🏁 TP: *{c['liq_tp_cents']}¢* | ⏰ Страховка: *{c['liq_new_order_time']}с* до конца окна | 🕘 В списке: *{c['liq_recent_count']}* сделок")
     lines.append(f"🔁 Чек: {c['liq_check_interval']}с | 👁 Скан: {c['liq_scan_interval']}с")
     lines.append(f"📊 *Свеча берётся с Gate.io SPOT* (а не фьючерсов) — это та же цена, что на графике Polymarket Up/Down")
@@ -1429,45 +1492,42 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
         entry_cents = limit_price_cents
 
     # === Размер позиции ===
-    # Базовая формула: stake / (entry_cents/100) = кол-во shares.
-    # В лимитном режиме дополнительно учитываем min_size рынка, чтобы не упереться
-    # в "minimum $5" от Polymarket. В рыночном этого лимита нет (исполняется сразу).
-    shares = round(stake_usd / (entry_cents / 100.0), 4)
+    # Минимум ордера Polymarket задан в ДОЛЯХ (обычно 5 shares), поэтому в
+    # деньгах он зависит от цены: 5 shares по 49¢ — это $2.45, а не $1.
+    # Раньше бот отправлял 2 доли на $1, а polymarket_trading молча
+    # поднимал размер до 5 долей — реально списывалось $2.50, хотя в
+    # состоянии сохранялась ставка $1. Теперь считаем всё заранее.
     market_info = pt.get_market_info(token_id)
+    plan = plan_order(stake_usd, entry_cents, market_info)
+    min_mode = get_min_size_mode()
 
-    if entry_mode == "limit":
-        # Лимитный ордер требует минимум $5. Если наша ставка меньше — не входим,
-        # иначе Polymarket поднимет size до минимума и изменит эффективную ставку.
-        if market_info:
-            min_size = float(market_info.get("min_size") or 0)
-        else:
-            min_size = POLY_MIN_ORDER_USD
-        if stake_usd < min_size and stake_usd < POLY_MIN_ORDER_USD:
-            log.warning(
-                f"liq_strategy: лимитный вход {symbol} — ставка ${stake_usd} < ${min_size}, пропускаю"
-            )
-            try:
-                await _send(
-                    context, cid,
-                    f"⚠️ Пропускаю `{symbol}`: лимитный вход требует ≥ ${min_size:.0f}, а у нас "
-                    f"${stake_usd:.2f}. Переключи тип входа на «рыночный» в ⚙️ Настройках.",
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
-            return
-    elif entry_mode == "market":
-        # Рыночный вход: Polymarket исполнит сразу по лучшей цене,
-        # жёсткого $5 минимума нет. Но мы всё равно чуть-чуть подстрахуемся.
-        if market_info:
-            min_size = float(market_info.get("min_size") or 0)
-            if min_size > 0 and stake_usd < min_size:
-                # Всё равно пробуем — рыночный исполнится по реальной цене и
-                # реальному размеру; но честно сообщим пользователю.
-                log.info(
-                    f"liq_strategy: рыночный вход {symbol} — ставка ${stake_usd} < ${min_size} (мин. размера), "
-                    f"исполним по реальной цене"
-                )
+    if plan["below_min"] and min_mode == "skip":
+        log.warning(
+            f"liq_strategy: {symbol} лот ${stake_usd:.2f} меньше минимума рынка "
+            f"({plan['min_shares']:g} долей = ${plan['min_cost']:.2f} при {entry_cents}¢) — пропускаю"
+        )
+        set_setting(
+            "liq_last_scan",
+            f"[{symbol}] лот ${stake_usd:.2f} < минимума рынка ${plan['min_cost']:.2f} — вход пропущен",
+        )
+        await _send(
+            context, cid,
+            f"⚠️ Пропускаю вход `{symbol}` {outcome}\n"
+            f"💵 Твой лот: *${stake_usd:.2f}* ({plan['want_shares']:g} долей)\n"
+            f"🚧 Минимум рынка: *{plan['min_shares']:g} долей* = *${plan['min_cost']:.2f}* по цене {entry_cents}¢\n\n"
+            f"Polymarket не принимает ордера меньше {plan['min_shares']:g} долей. Варианты:\n"
+            f"• подними «💵 Первый лот» до ${plan['min_cost']:.2f} и выше;\n"
+            f"• или поставь «🚧 Лот меньше минимума» = *bump*, чтобы бот "
+            f"сам заходил минимально возможным размером.",
+        )
+        return
+
+    shares = plan["shares"]
+    if plan["below_min"]:
+        log.info(
+            f"liq_strategy: {symbol} лот ${stake_usd:.2f} поднят до минимума рынка "
+            f"{shares:g} долей = ${plan['cost']:.2f} (режим bump)"
+        )
 
     stake_usd_final = round(shares * entry_cents / 100.0, 4)
     demo = get_setting("demo_mode", "0") == "1"
@@ -1476,7 +1536,10 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
     if demo:
         order_ok = True
     else:
-        res = pt.place_order(token_id, "BUY", entry_cents / 100.0, shares)
+        # allow_min_bump=False: размер уже посчитан с учётом минимума,
+        # и подменять его «за нашей спиной» больше нельзя.
+        res = pt.place_order(token_id, "BUY", entry_cents / 100.0, shares,
+                             allow_min_bump=False)
         order_ok = isinstance(res, dict) and not res.get("error")
         if not order_ok:
             log.warning(f"liq_strategy: ордер не прошёл: {res}")
@@ -1504,6 +1567,7 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
         "entry_cents": entry_cents,
         "entry_mode": entry_mode,
         "limit_price_cents": limit_price_cents,
+        "min_shares": plan["min_shares"],
         "window_end": window_end,
         "window_start": start_next,
         "series": series,
@@ -1962,7 +2026,10 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
     if tp_hit and time_left > 0:
         # Сумма, которую получим при продаже по TP-цене
         sell_value_at_tp = shares * (tp_cents / 100.0)
-        can_use_limit = sell_value_at_tp >= POLY_MIN_ORDER_USD
+        # Лимитку примут, если хватает и долей (минимум рынка), и суммы.
+        min_shares = float(pos.get("min_shares") or POLY_MIN_ORDER_SHARES)
+        can_use_limit = (shares >= min_shares
+                         and sell_value_at_tp >= POLY_MIN_NOTIONAL_USD)
 
         if is_demo_flag:
             # В демо — sell-market имитируем, фиксируем TP
@@ -2013,8 +2080,8 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
             # Продаём по РЫНКУ сразу, фиксируем прибыль по текущей цене.
             sell_price = max(0.01, min(0.99, max(1, min(99, close_price)) / 100.0))
             log.info(f"liq: 🎯 {symbol} TP {tp_cents}¢ — лимитка не пройдёт "
-                     f"(размер ${sell_value_at_tp:.2f} < ${POLY_MIN_ORDER_USD}), "
-                     f"продаём по РЫНКУ @ {close_price}¢")
+                     f"({shares:g} долей при минимуме {min_shares:g}, "
+                     f"${sell_value_at_tp:.2f}), продаём по РЫНКУ @ {close_price}¢")
             try:
                 res = pt.place_order(pos["token_id"], "SELL", sell_price, shares)
                 ok = isinstance(res, dict) and not res.get("error")
@@ -2078,7 +2145,14 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
         )
 
         salvage_price = 0
-        if not is_demo_flag and close_price > 0:
+        min_shares_pos = float(pos.get("min_shares") or POLY_MIN_ORDER_SHARES)
+        can_sell = shares >= min_shares_pos
+        if not can_sell:
+            log.info(
+                f"liq: {symbol} остаток {shares:g} долей меньше минимума "
+                f"{min_shares_pos:g} — продать нельзя, доли просто сгорят при расчёте"
+            )
+        if not is_demo_flag and close_price > 0 and can_sell:
             # Пытаемся продать остаток — это лучше, чем дать позиции
             # обнулиться при расчёте. Если не вышло, не страшно.
             sell_price = max(0.01, min(0.99, max(1, min(99, close_price)) / 100.0))
@@ -2403,23 +2477,33 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
     else:
         entry_cents = limit_price_cents
 
-    shares = round(stake_usd / (entry_cents / 100.0), 4)
+    # Размер шага с учётом минимума рынка (см. plan_order).
     market_info = pt.get_market_info(token_id)
+    plan = plan_order(stake_usd, entry_cents, market_info)
+    min_mode = get_min_size_mode()
 
-    if entry_mode == "limit":
-        min_size = float(market_info.get("min_size") or POLY_MIN_ORDER_USD) if market_info else POLY_MIN_ORDER_USD
-        if stake_usd < min_size and stake_usd < POLY_MIN_ORDER_USD:
-            log.warning(f"liq: мартингейл {symbol} — ставка ${stake_usd} < ${min_size}, не вхожу")
-            try:
-                await _send(
-                    context, cid, f"⚠️ Мартингейл `{symbol}` (шаг {series}): лимитный вход требует ≥ ${min_size:.0f}, "
-                         f"у нас ${stake_usd:.2f}. Переключи тип входа на «рыночный».",
-                    parse_mode="Markdown")
-            except Exception:
-                pass
-            state["series"][symbol] = 0
-            _save_state(state)
-            return
+    if plan["below_min"] and min_mode == "skip":
+        log.warning(
+            f"liq: мартингейл {symbol} шаг {series} — ставка ${stake_usd:.2f} меньше "
+            f"минимума рынка ${plan['min_cost']:.2f} ({plan['min_shares']:g} долей), серия прервана"
+        )
+        await _send(
+            context, cid,
+            f"⚠️ Мартингейл `{symbol}` (шаг {series}) остановлен\n"
+            f"💵 Ставка шага: *${stake_usd:.2f}*, минимум рынка: "
+            f"*${plan['min_cost']:.2f}* ({plan['min_shares']:g} долей по {entry_cents}¢)\n"
+            f"Подними «💵 Первый лот» или включи режим *bump* в настройках.",
+        )
+        state["series"][symbol] = 0
+        _save_state(state)
+        return
+
+    shares = plan["shares"]
+    if plan["below_min"]:
+        log.info(
+            f"liq: мартингейл {symbol} шаг {series} — ставка ${stake_usd:.2f} поднята "
+            f"до минимума {shares:g} долей = ${plan['cost']:.2f}"
+        )
 
     stake_usd_final = round(shares * entry_cents / 100.0, 4)
     demo = get_setting("demo_mode", "0") == "1"
@@ -2428,7 +2512,8 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
     if demo:
         order_ok = True
     else:
-        res = pt.place_order(token_id, "BUY", entry_cents / 100.0, shares)
+        res = pt.place_order(token_id, "BUY", entry_cents / 100.0, shares,
+                             allow_min_bump=False)
         order_ok = isinstance(res, dict) and not res.get("error")
         if not order_ok:
             log.warning(f"liq: мартингейл {symbol} — ордер не прошёл: {res}")
@@ -2447,6 +2532,7 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
         "slug": slug, "token_id": token_id, "outcome": outcome,
         "stake": stake_usd_final, "shares": shares, "entry_cents": entry_cents,
         "entry_mode": entry_mode, "limit_price_cents": limit_price_cents,
+        "min_shares": plan["min_shares"],
         "window_end": window_end, "window_start": start_next,
         "series": series, "is_demo": is_demo_flag,
         "agg_snapshot": agg, "candle": candle, "symbol": symbol,

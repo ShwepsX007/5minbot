@@ -15,6 +15,7 @@ PARAMS = [
     ("liq_base_stake", "💵 Первый лот, $", ["1", "2", "5", "10"]),
     ("liq_martingale_mult", "✖️ Множитель мартингейла", ["1.5", "2", "2.5", "3"]),
     ("liq_entry_mode", "🚀 Тип входа", ["market", "limit"]),
+    ("liq_min_size_mode", "🚧 Лот меньше минимума рынка", ["skip", "bump"]),
     ("liq_entry_price_cents", "🎯 Цена входа (лимит), ¢", ["50", "51", "55", "60"]),
     ("liq_scan_interval", "👁 Скан открытой позиции, сек", ["1", "2", "5"]),
     ("liq_new_order_time", "⏳ Фиксация исхода за N сек. до конца", ["1", "3", "5", "10"]),
@@ -75,6 +76,20 @@ LIQ_PARAM_META = {
             "limit — бот выставляет ордер по фиксированной цене (нужно ≥$5, "
             "может не исполниться).\n"
             "Введи: market или limit"
+        ),
+    },
+    "liq_min_size_mode": {
+        "type": "enum",
+        "allowed": ["skip", "bump"],
+        "hint": (
+            "Polymarket не принимает ордер меньше минимума рынка — обычно "
+            "5 долей. В деньгах это зависит от цены: 5 долей по 50¢ = $2.50, "
+            "по 20¢ = $1.00.\n"
+            "skip — не входить, если твой лот меньше минимума (бот напишет, "
+            "какая сумма нужна). Ставка из настроек соблюдается точно.\n"
+            "bump — входить минимально возможным размером рынка (лот может "
+            "оказаться больше заданного).\n"
+            "Введи: skip или bump"
         ),
     },
     "liq_entry_price_cents": {
@@ -161,6 +176,18 @@ def validate_manual_input(key: str, raw_text: str):
         if low.upper() in [a.upper() for a in allowed]:
             return True, low.lower(), ""
         return False, "", f"❌ Допустимо только: {', '.join(allowed)}"
+
+    if key == "liq_min_size_mode":
+        low = text.lower().strip()
+        aliases = {
+            "skip": "skip", "пропустить": "skip", "пропуск": "skip",
+            "s": "skip", "нет": "skip",
+            "bump": "bump", "поднять": "bump", "долить": "bump",
+            "минимум": "bump", "b": "bump", "да": "bump",
+        }
+        if low in aliases:
+            return True, aliases[low], ""
+        return False, "", "❌ Введи: skip (пропускать вход) или bump (заходить минимумом рынка)"
 
     if key == "liq_entry_mode":
         low = text.lower().strip()
@@ -283,6 +310,8 @@ def param_index(key):
 _PRETTY_VALUE = {
     "market": "🚀 Рыночный",
     "limit":  "📋 Лимитный",
+    "skip": "⏭ Пропускать вход",
+    "bump": "⬆️ Заходить минимумом",
     "5m": "5m", "15m": "15m", "1h": "1h",
 }
 
