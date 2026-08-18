@@ -504,6 +504,78 @@ def get_balance() -> Optional[float]:
 # ORDER PLACEMENT CORE
 # =========================================================
 
+MIN_MARKET_ORDER_USD = 1.0     # FOK/FAK: минимум $1 (как на сайте)
+DEFAULT_MIN_LIMIT_SHARES = 5.0  # GTC/GTD: минимум 5 долей
+
+
+def _post_market_order_with_client(client, token_id, side: str, amount: float,
+                                   order_type: str = "FOK"):
+    """Настоящий рыночный ордер (FOK/FAK).
+
+    На Polymarket минимум в 5 долей действует только для ЛИМИТНЫХ ордеров
+    (GTC/GTD), которые ложатся в стакан. Маркетабельные FOK/FAK в стакане не
+    лежат, поэтому для них ограничение другое — минимум $1 по сумме. Именно
+    так работает кнопка Market на сайте, где можно купить на $1.
+
+    amount: для BUY — сумма в долларах, для SELL — количество долей.
+    """
+    from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
+
+    ot = OrderType.FOK if str(order_type).upper() == "FOK" else OrderType.FAK
+    order_args = MarketOrderArgsV2(
+        token_id=str(token_id),
+        amount=float(amount),
+        side=side,
+        order_type=ot,
+    )
+
+    try:
+        result = client.create_and_post_market_order(order_args, order_type=ot)
+        log.info(f"✅ Market order placed (create_and_post_market_order): {result}")
+        return result
+    except AttributeError:
+        pass
+    except Exception as e:
+        err1 = e
+        log.warning(f"create_and_post_market_order failed: {e}")
+
+    # Фолбэк: собрать и отправить двумя шагами
+    order = client.create_market_order(order_args)
+    result = client.post_order(order, ot)
+    log.info(f"✅ Market order placed (create_market_order + post_order): {result}")
+    return result
+
+
+def _extract_fill(res) -> Optional[dict]:
+    """Пытается достать фактический объём и цену исполнения из ответа CLOB.
+
+    У рыночного ордера мы задаём сумму в долларах, а сколько долей за неё
+    дали — знает только биржа. Если в ответе есть цифры, используем их,
+    иначе вызывающий код останется на своей оценке.
+    """
+    data = _object_to_dict(res)
+    if not isinstance(data, dict):
+        return None
+
+    def _num(*keys):
+        for k in keys:
+            v = data.get(k)
+            if v in (None, "", 0, "0"):
+                continue
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    shares = _num("sizeMatched", "size_matched", "takingAmount", "taking_amount",
+                  "matchedSize", "filledSize")
+    price = _num("price", "avgPrice", "average_price")
+    if not shares:
+        return None
+    return {"shares": shares, "price": price}
+
+
 def _post_order_with_client(client, token_id, side: str, price: float, size: float):
     from py_clob_client_v2.clob_types import OrderArgsV2
 
@@ -646,6 +718,86 @@ def place_order(token_id, side: str, price: float, size: float,
 
     except Exception as e:
         log.error(f"place_order error: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        return {"error": str(e)}
+
+
+def place_market_order(token_id, side: str, amount: float,
+                       order_type: str = "FOK") -> dict:
+    """Рыночный ордер (FOK/FAK) — то же, что кнопка Market на сайте.
+
+    BUY : amount — сумма в долларах (минимум $1).
+    SELL: amount — количество долей (сумма тоже должна быть >= $1).
+
+    В отличие от лимитного place_order здесь НЕТ ограничения в 5 долей:
+    оно действует только для ордеров, которые ложатся в стакан (GTC/GTD).
+    """
+    global _client
+
+    try:
+        if _client is None:
+            return {"error": "Trading client not initialized"}
+
+        side = "BUY" if side.upper() == "BUY" else "SELL"
+        amount = float(amount)
+        if not math.isfinite(amount) or amount <= 0:
+            return {"error": "Amount must be a positive finite number"}
+
+        market_info = get_market_info(token_id)
+        if market_info and not market_info["accepting_orders"]:
+            return {"error": "Market is closed or resolved"}
+
+        if side == "BUY" and amount < MIN_MARKET_ORDER_USD:
+            return {
+                "error": (f"сумма ${amount:.2f} меньше минимума рыночного "
+                          f"ордера ${MIN_MARKET_ORDER_USD:.2f}"),
+                "code": "below_min_notional",
+                "min_notional_usd": MIN_MARKET_ORDER_USD,
+            }
+
+        log.info(f"Placing MARKET order: {side} amount={amount} "
+                 f"({'USD' if side == 'BUY' else 'shares'}) "
+                 f"type={order_type} | token={token_id}")
+
+        try:
+            _update_balance_allowance_safe(_client)
+        except Exception as e:
+            log.warning(f"⚠️ Could not update allowance: {e}")
+
+        current_sig = _get_int_env("POLY_SIGNATURE_TYPE", 1)
+        sig_candidates = []
+        for st in [current_sig, 1, 2, 3, 0]:
+            if st not in sig_candidates:
+                sig_candidates.append(st)
+
+        last_error = None
+        for st in sig_candidates:
+            try:
+                log.info(f"🔄 Market order через sig_type={st}...")
+                client = _build_client(st)
+                try:
+                    _update_balance_allowance_safe(client)
+                except Exception as e:
+                    log.warning(f"allowance update sig_type={st} failed: {e}")
+
+                result = _post_market_order_with_client(
+                    client, token_id, side, amount, order_type)
+
+                _client = client
+                update_env_and_config({"POLY_SIGNATURE_TYPE": str(st)})
+                log.info(f"✅ Рабочий sig_type для market-ордера: {st}")
+                return result
+            except Exception as e:
+                last_error = e
+                log.warning(f"sig_type={st} market order failed: "
+                            f"{_extract_error_text(e)}")
+                continue
+
+        return {"error": str(last_error)}
+
+    except Exception as e:
+        log.error(f"place_market_order error: {e}")
         import traceback
         log.error(traceback.format_exc())
         return {"error": str(e)}
