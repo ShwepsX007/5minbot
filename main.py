@@ -6,6 +6,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Cal
 from config import TOKEN, BASE_DIR
 from database import init_db
 import liq_api
+import chainlink_price
 from bot import cmd_start, on_text, on_callback, schedule_jobs
 
 log_path = os.path.join(BASE_DIR, "bot.log")
@@ -53,6 +54,9 @@ async def post_init(application):
         "bybit_liquidations": liq_api.bybit_ws_listener,
         "binance_liquidations": liq_api.binance_ws_listener,
         "gate_liquidations": liq_api.gate_ws_listener,
+        # Цена, по которой Polymarket рассчитывает Up/Down: Chainlink TWAP
+        # через публичный RTDS Polymarket (ключи не нужны).
+        "chainlink_prices": chainlink_price.rtds_listener,
     }
     tasks = []
     for name, factory in listeners.items():
@@ -81,6 +85,7 @@ async def post_shutdown(application):
         "bybit_liquidations",
         "binance_liquidations",
         "gate_liquidations",
+        "chainlink_prices",
     ):
         task = application.bot_data.pop(f"{name}_task", None)
         if task and task not in tasks:

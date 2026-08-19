@@ -16,6 +16,8 @@ PARAMS = [
     ("liq_martingale_mult", "✖️ Множитель мартингейла", ["1.5", "2", "2.5", "3"]),
     ("liq_entry_mode", "🚀 Тип входа", ["market", "limit"]),
     ("liq_min_size_mode", "🚧 Лот меньше минимума рынка", ["skip", "bump"]),
+    ("liq_candle_source", "📊 Источник свечи", ["chainlink", "gate_spot"]),
+    ("liq_entry_confirm_sec", "⏳ Перепроверка свечи за N сек", ["1", "2", "3", "5"]),
     ("liq_entry_price_cents", "🎯 Цена входа (лимит), ¢", ["50", "51", "55", "60"]),
     ("liq_scan_interval", "👁 Скан открытой позиции, сек", ["1", "2", "5"]),
     ("liq_new_order_time", "⏳ Фиксация исхода за N сек. до конца", ["1", "3", "5", "10"]),
@@ -91,6 +93,30 @@ LIQ_PARAM_META = {
             "bump — входить минимально возможным размером рынка (лот может "
             "оказаться больше заданного).\n"
             "Введи: skip или bump"
+        ),
+    },
+    "liq_candle_source": {
+        "type": "enum",
+        "allowed": ["chainlink", "gate_spot"],
+        "hint": (
+            "chainlink — TWAP Chainlink через публичный поток Polymarket "
+            "(именно по нему рынок и рассчитывается: у 5m окно усреднения "
+            "30 сек, у 15m/1h — 60 сек). Рекомендуется.\n"
+            "gate_spot — спот Gate.io. Считается быстрее, но расходится с "
+            "Polymarket: там, где на рынке явная свеча вниз, спот может "
+            "показать дожи.\n"
+            "Введи: chainlink или gate_spot"
+        ),
+    },
+    "liq_entry_confirm_sec": {
+        "type": "int",
+        "min": 1,
+        "max": 60,
+        "hint": (
+            "За сколько секунд до закрытия сигнальной свечи бот перепроверит "
+            "её направление. Если свеча перекрасилась (откат уже случился "
+            "внутри неё) — вход в следующее окно отменяется. От 1 до 60. "
+            "Пример: 2"
         ),
     },
     "liq_entry_price_cents": {
@@ -177,6 +203,19 @@ def validate_manual_input(key: str, raw_text: str):
         if low.upper() in [a.upper() for a in allowed]:
             return True, low.lower(), ""
         return False, "", f"❌ Допустимо только: {', '.join(allowed)}"
+
+    if key == "liq_candle_source":
+        low = text.lower().strip()
+        aliases = {
+            "chainlink": "chainlink", "чейнлинк": "chainlink",
+            "полимаркет": "chainlink", "polymarket": "chainlink",
+            "twap": "chainlink", "c": "chainlink",
+            "gate_spot": "gate_spot", "gate": "gate_spot", "gateio": "gate_spot",
+            "спот": "gate_spot", "gate spot": "gate_spot", "g": "gate_spot",
+        }
+        if low in aliases:
+            return True, aliases[low], ""
+        return False, "", "❌ Введи: chainlink (как у Polymarket) или gate_spot"
 
     if key == "liq_min_size_mode":
         low = text.lower().strip()
@@ -311,6 +350,8 @@ def param_index(key):
 _PRETTY_VALUE = {
     "market": "🚀 Рыночный",
     "limit":  "📋 Лимитный",
+    "chainlink": "🔗 Chainlink TWAP",
+    "gate_spot": "🟢 Спот Gate.io",
     "skip": "⏭ Пропускать вход",
     "bump": "⬆️ Заходить минимумом",
     "5m": "5m", "15m": "15m", "1h": "1h",

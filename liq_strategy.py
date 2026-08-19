@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 import aiohttp
 
 import liq_api
+import chainlink_price as clp
 from database import get_setting, set_setting, add_trade_history, get_trade_statistics
 
 log = logging.getLogger("bot.liq_strategy")
@@ -116,9 +117,18 @@ DEFAULTS = {
     #   "skip" — не входить и написать, какой лот нужен (по умолчанию);
     #   "bump" — войти минимально возможным размером рынка.
     "liq_min_size_mode": "skip",
+    # Источник цены для свечей:
+    #   "chainlink" — TWAP Chainlink через публичный RTDS Polymarket
+    #                 (тот же поток, по которому рынок и рассчитывается);
+    #   "gate_spot" — спот Gate.io (запасной вариант).
+    "liq_candle_source": "chainlink",
+    # За сколько секунд до конца сигнальной свечи перепроверяем её
+    # направление перед входом в следующее окно.
+    "liq_entry_confirm_sec": "2",
 }
 
 MIN_SIZE_MODES = ("skip", "bump")
+CANDLE_SOURCES = ("chainlink", "gate_spot")
 
 # Минимум ордера на Polymarket CLOB задаётся в ДОЛЯХ (shares), а не в
 # долларах: обычно 5 shares. В деньгах это зависит от цены — 5 shares по
@@ -261,8 +271,8 @@ def set_param(key, value):
 
 # ===================== СОСТОЯНИЕ (ПЕРСИСТЕНТНОЕ) =====================
 def _empty_state() -> dict:
-    """Свежее состояние: per-symbol series + per-symbol position."""
-    return {"series": {}, "positions": {}}
+    """Свежее состояние: серии, позиции и отложенные (неподтверждённые) входы."""
+    return {"series": {}, "positions": {}, "pending": {}}
 
 
 def _load_state() -> dict:
@@ -279,7 +289,7 @@ def _load_state() -> dict:
             old_sym = get_setting("liq_symbol", "") or "BTC_USDT"
             old_series = int(st.get("series", 0) or 0)
             old_pos = st.get("position")
-            new_st = {"series": {old_sym: old_series}, "positions": {}}
+            new_st = {"series": {old_sym: old_series}, "positions": {}, "pending": {}}
             if old_pos and isinstance(old_pos, dict):
                 # старая позиция была привязана к одной монете
                 sym = old_pos.get("symbol", old_sym)
@@ -288,10 +298,13 @@ def _load_state() -> dict:
         # Нормализация для нового формата
         st.setdefault("series", {})
         st.setdefault("positions", {})
+        st.setdefault("pending", {})
         if not isinstance(st["series"], dict):
             st["series"] = {}
         if not isinstance(st["positions"], dict):
             st["positions"] = {}
+        if not isinstance(st["pending"], dict):
+            st["pending"] = {}
         return st
     except Exception:
         return _empty_state()
@@ -504,7 +517,8 @@ def get_entry_mode() -> str:
 
 def any_active_position() -> bool:
     """Есть ли открытая позиция по ЛЮБОЙ монете (используется как глобальный стоп)."""
-    return bool(_load_state().get("positions") or {})
+    st = _load_state()
+    return bool((st.get("positions") or {}) or (st.get("pending") or {}))
 
 
 def any_active_series() -> bool:
@@ -528,9 +542,12 @@ def can_open_for(symbol: str) -> tuple[bool, str]:
     st = _load_state()
     positions = st.get("positions") or {}
     series = st.get("series") or {}
+    pending = st.get("pending") or {}
 
     if symbol in positions:
         return False, "уже есть открытая позиция по этой монете"
+    if symbol in pending:
+        return False, "по этой монете уже ждём подтверждения сигнала"
 
     # По этой монете идёт серия (без открытой позиции) — разрешаем продолжение
     if int(series.get(symbol, 0) or 0) > 0:
@@ -540,6 +557,9 @@ def can_open_for(symbol: str) -> tuple[bool, str]:
     for other_sym, pos in positions.items():
         if other_sym != symbol:
             return False, f"открыта позиция по `{other_sym}`"
+    for other_sym in pending:
+        if other_sym != symbol:
+            return False, f"ждём подтверждения сигнала по `{other_sym}`"
     for other_sym, ser in series.items():
         if other_sym != symbol and int(ser or 0) > 0:
             return False, f"идёт серия мартингейла по `{other_sym}`"
@@ -784,6 +804,24 @@ def _get_trade_stats(is_demo: int):
     }
 
 
+def _candle_source_line() -> str:
+    """Откуда берём свечи и живы ли данные Chainlink."""
+    src = get_candle_source()
+    if src != "chainlink":
+        return "📊 Свеча: *спот Gate.io* (Polymarket считает по Chainlink — возможны расхождения)"
+    try:
+        st = clp.status()
+    except Exception:
+        return "📊 Свеча: *Chainlink TWAP* (статус недоступен)"
+    age = st.get("age_sec")
+    if st.get("connected") and age is not None and age < 30:
+        return (f"📊 Свеча: *Chainlink TWAP* через Polymarket RTDS 🟢 "
+                f"(тиков {st['updates']}, пар {st['symbols']}, обновление {int(age)}с назад)")
+    if st.get("connected"):
+        return "📊 Свеча: *Chainlink TWAP* 🟡 подключено, ждём тики (пока фолбэк на спот Gate.io)"
+    return "📊 Свеча: *Chainlink TWAP* 🔴 нет связи — временно считаем по споту Gate.io"
+
+
 def _ws_status_line() -> str:
     """Строка диагностики WS-источников ликвидаций.
 
@@ -843,7 +881,8 @@ def get_status_text() -> str:
     lines.append(f"🚧 {min_lot_txt} | если лот меньше: *{min_mode_txt}*")
     lines.append(f"🏁 TP: *{c['liq_tp_cents']}¢* | ⏰ Страховка: *{c['liq_new_order_time']}с* до конца окна | 🕘 В списке: *{c['liq_recent_count']}* сделок")
     lines.append(f"🔁 Чек: {c['liq_check_interval']}с | 👁 Скан: {c['liq_scan_interval']}с")
-    lines.append(f"📊 *Свеча берётся с Gate.io SPOT* (а не фьючерсов) — это та же цена, что на графике Polymarket Up/Down")
+    lines.append(_candle_source_line())
+    lines.append(f"⏳ Перепроверка свечи перед входом: за *{get_entry_confirm_sec()}с* до её закрытия")
     lines.append(_ws_status_line())
     lines.append("")
 
@@ -897,6 +936,18 @@ def get_status_text() -> str:
             lines.append("")
     else:
         lines.append("📭 *Не выбрано ни одной пары — открой ⚙️ Настройки.*")
+        lines.append("")
+
+    # === Отложенные входы (ждут подтверждения свечой) ===
+    pending = st.get("pending") or {}
+    if pending:
+        lines.append("⏸ *Ожидают подтверждения свечой:*")
+        for sym, req in pending.items():
+            left = int((req.get("signal_window_end") or 0) - time.time())
+            lines.append(
+                f"   `{sym}` → *{req.get('outcome','?')}* | свеча на сигнале "
+                f"*{req.get('signal_candle','?')}* | до проверки {max(left, 0)}с"
+            )
         lines.append("")
 
     # === Последний каскад (любой монеты) ===
@@ -1226,6 +1277,18 @@ async def get_candles(session, symbol: str, timeframe: str = "5m",
 
 async def get_prev_candle(session, symbol: str, timeframe: str = "5m") -> dict | None:
     """Последняя ЗАВЕРШЁННАЯ свеча — на неё смотрим при входе по сигналу."""
+    dur = TF_SECONDS.get(timeframe, 300)
+
+    if get_candle_source() == "chainlink":
+        try:
+            prev_start = _window_bounds(timeframe, time.time(), -1)[0]
+            cndl = clp.get_window_candle(symbol, prev_start,
+                                         prev_start + dur, timeframe)
+            if cndl:
+                return cndl
+        except Exception as e:
+            log.debug(f"chainlink prev candle err: {e}")
+
     candles = await get_candles(session, symbol, timeframe, limit=4)
     for cndl in reversed(candles):
         if cndl.get("closed"):
@@ -1234,6 +1297,27 @@ async def get_prev_candle(session, symbol: str, timeframe: str = "5m") -> dict |
     if len(candles) >= 2:
         return candles[-2]
     return None
+
+
+def get_candle_source() -> str:
+    v = str(get_setting("liq_candle_source",
+                        DEFAULTS["liq_candle_source"]) or "").strip().lower()
+    return v if v in CANDLE_SOURCES else "chainlink"
+
+
+def resolve_state(candle: dict | None) -> str | None:
+    """Направление окна по правилу Polymarket: close >= open → UP.
+
+    В отличие от candle_state здесь НЕТ зоны дожи: рынок Up/Down
+    рассчитывается строго «больше либо равно», ничьей не бывает.
+    """
+    if not candle:
+        return None
+    o = candle.get("open") or 0
+    c = candle.get("close") or 0
+    if o <= 0 or c <= 0:
+        return None
+    return "UP" if c >= o else "DOWN"
 
 
 async def get_window_candle(session, symbol: str, timeframe: str,
@@ -1247,6 +1331,21 @@ async def get_window_candle(session, symbol: str, timeframe: str,
     """
     if not window_start:
         return None
+
+    dur = TF_SECONDS.get(timeframe, 300)
+
+    # 1. Chainlink TWAP через RTDS Polymarket — тот же поток, по которому
+    #    рынок и рассчитывается. Спот Gate.io здесь регулярно расходится:
+    #    у него бывает дожи там, где на Polymarket явная свеча вниз.
+    if get_candle_source() == "chainlink":
+        try:
+            cndl = clp.get_window_candle(symbol, window_start,
+                                         window_start + dur, timeframe)
+            if cndl:
+                return cndl
+        except Exception as e:
+            log.debug(f"chainlink window candle err: {e}")
+
     candles = await get_candles(session, symbol, timeframe, limit=5, force=force)
     target = int(window_start)
     for cndl in candles:
@@ -1333,6 +1432,12 @@ async def scan_for_signal(context):
     except Exception as e:
         log.debug(f"set_symbols err: {e}")
 
+    # Подстраховка: если частый джоб не запущен, подтверждаем и здесь.
+    try:
+        await process_pending(context)
+    except Exception as e:
+        log.exception(f"process_pending err: {e}")
+
     state = _load_state()
     async with aiohttp.ClientSession() as session:
         for symbol in symbols:
@@ -1356,11 +1461,19 @@ async def scan_for_signal(context):
 
 
 async def scan_open_position(context):
-    """Проверяем все открытые позиции (по всем монетам)."""
+    """Проверяем все открытые позиции и отложенные входы (по всем монетам)."""
     if not is_active():
         return
     cid = context.job.data.get("cid")
     c = cfg()
+
+    # Этот джоб самый частый (liq_scan_interval, обычно 1-2с), поэтому
+    # именно он ловит последние секунды сигнальной свечи.
+    try:
+        await process_pending(context)
+    except Exception as e:
+        log.exception(f"process_pending err: {e}")
+
     state = _load_state()
     positions = state.get("positions") or {}
     if not positions:
@@ -1514,15 +1627,194 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
         "liq_last_scan",
         f"[{symbol}] СИГНАЛ {agg['dominant']} ${agg['total_usd']:,.0f} свеча {candle} → {outcome} ✅ буфер {len(_events_buffer[symbol])}",
     )
-    await _enter_trade(context, cid, session, c, state, symbol, outcome, agg, candle, oi_data)
+    # Вход не делаем прямо сейчас: сначала дождёмся конца ТЕКУЩЕЙ свечи и
+    # перепроверим её направление (см. process_pending).
+    await _register_pending(context, cid, session, c, state, symbol, outcome,
+                            agg, candle, oi_data)
 
 
-async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, candle, oi_data=None):
+def get_entry_confirm_sec() -> int:
+    try:
+        v = int(float(get_setting("liq_entry_confirm_sec",
+                                  DEFAULTS["liq_entry_confirm_sec"])))
+    except (TypeError, ValueError):
+        v = 2
+    return max(1, min(60, v))
+
+
+async def _register_pending(context, cid, session, c, state, symbol, outcome,
+                            agg, candle, oi_data=None):
+    """Ставит вход в очередь до конца сигнальной свечи.
+
+    Каскад ликвидаций происходит ВНУТРИ идущей свечи, и до её закрытия она
+    ещё может перекраситься. Если это случилось — ожидаемый откат уже
+    состоялся внутри самой сигнальной свечи, и входить в следующее окно
+    против неё поздно. Поэтому решение откладывается до последних секунд
+    свечи, а там перепроверяется (process_pending).
+    """
+    tf = c["liq_timeframe"]
+    now = time.time()
+    win_start, win_end = _window_bounds(tf, now, 0)
+
+    pending = state.setdefault("pending", {})
+    pending[symbol] = {
+        "symbol": symbol,
+        "outcome": outcome,
+        "signal_candle": candle,          # направление на момент сигнала
+        "signal_window_start": win_start,
+        "signal_window_end": win_end,
+        "created_ts": now,
+        "agg": agg,
+        "oi": oi_data or {},
+        "cid": cid,
+        "tf": tf,
+    }
+    _save_state(state)
+
+    left = int(win_end - now)
+    log.info(
+        f"liq: ⏸ {symbol} сигнал {agg['dominant']} свеча {candle} → {outcome}; "
+        f"жду конца свечи ({left}с) для перепроверки"
+    )
+    await _send(
+        context, cid,
+        f"⏸ *Сигнал принят, ждём конца свечи* `{symbol}`\n"
+        f"💥 Каскад: *{agg['dominant']}* ${agg['total_usd']:,.0f} | свеча сейчас *{candle}*\n"
+        f"🎯 План: войти *{outcome}* в следующее окно\n"
+        f"⏳ Перепроверю направление свечи за {get_entry_confirm_sec()}с до её закрытия "
+        f"(осталось {left}с). Если свеча перекрасится — вход отменю.",
+    )
+
+
+async def process_pending(context):
+    """Подтверждает или отменяет отложенные входы в конце сигнальной свечи."""
+    if not is_active():
+        return
+    state = _load_state()
+    pending = state.get("pending") or {}
+    if not pending:
+        return
+
+    confirm_sec = get_entry_confirm_sec()
+    now = time.time()
+    c = cfg()
+
+    async with aiohttp.ClientSession() as session:
+        for symbol, req in list(pending.items()):
+            tf = req.get("tf") or c["liq_timeframe"]
+            dur = TF_SECONDS.get(tf, 300)
+            # Границу сигнального окна всегда выравниваем по сетке окон:
+            # из неё строится slug следующего рынка, ошибаться нельзя.
+            win_start = int(_window_bounds(
+                tf, req.get("signal_window_start") or now, 0)[0])
+            target_start = win_start + dur
+            # Момент перепроверки берём из заявки (в бою совпадает с границей).
+            win_end = req.get("signal_window_end") or target_start
+            cid = req.get("cid")
+
+            # Ещё рано — свеча не дорисована.
+            if now < win_end - confirm_sec:
+                continue
+
+            # Слишком поздно: следующее окно уже прошло больше половины.
+            if now >= win_end + dur * 0.5:
+                log.info(f"liq: ⌛ {symbol} отложенный вход протух, отменяю")
+                pending.pop(symbol, None)
+                _save_state(state)
+                await _send(context, cid,
+                            f"⌛ Отменяю отложенный вход `{symbol}`: "
+                            f"момент входа упущен.")
+                continue
+
+            # Свеча ликвидаций в её последние секунды (или уже закрытая)
+            cndl = await get_window_candle(session, symbol, tf, win_start,
+                                           force=True)
+            state_now = resolve_state(cndl) if cndl else None
+            src = (cndl or {}).get("src", "?")
+            delta_pct = 0.0
+            if cndl and cndl.get("open"):
+                delta_pct = (cndl["close"] - cndl["open"]) / cndl["open"] * 100
+
+            signal_candle = req.get("signal_candle")
+            outcome = req.get("outcome")
+
+            if state_now is None:
+                log.warning(f"liq: {symbol} нет данных по свече для подтверждения")
+                if now < win_end + 5:
+                    continue
+                pending.pop(symbol, None)
+                _save_state(state)
+                await _send(context, cid,
+                            f"⚠️ Отменяю вход `{symbol}`: нет данных по свече "
+                            f"для перепроверки.")
+                continue
+
+            # === Свеча перекрасилась — откат уже случился, входить поздно ===
+            if state_now != signal_candle:
+                pending.pop(symbol, None)
+                _save_state(state)
+                log.info(
+                    f"liq: 🚫 {symbol} свеча перекрасилась {signal_candle} → "
+                    f"{state_now} ({delta_pct:+.3f}%, {src}) — вход {outcome} отменён"
+                )
+                set_setting(
+                    "liq_last_scan",
+                    f"[{symbol}] свеча перекрасилась {signal_candle}→{state_now} — вход отменён",
+                )
+                await _send(
+                    context, cid,
+                    f"🚫 *Вход отменён* `{symbol}`\n"
+                    f"🕯 Свеча ликвидаций закрылась *{state_now}* "
+                    f"({delta_pct:+.3f}%), а на сигнале была *{signal_candle}*\n"
+                    f"↩️ Откат, ради которого мы шли в *{outcome}*, уже произошёл "
+                    f"внутри этой же свечи — следующее окно пропускаем.",
+                )
+                continue
+
+            # === Свеча подтвердилась — входим в следующее окно ===
+            pending.pop(symbol, None)
+            _save_state(state)
+
+            allowed, why = can_open_for(symbol)
+            if not allowed:
+                log.info(f"liq: {symbol} подтверждение есть, но вход закрыт: {why}")
+                continue
+
+            log.info(
+                f"liq: ✅ {symbol} свеча подтвердилась ({state_now}, "
+                f"{delta_pct:+.3f}%, {src}) — вхожу {outcome}"
+            )
+            state = _load_state()
+            await _enter_trade(context, cid, session, c, state, symbol,
+                               outcome, req.get("agg") or {}, signal_candle,
+                               req.get("oi") or {},
+                               confirm_note=(f"свеча закрылась {state_now} "
+                                             f"({delta_pct:+.3f}%) — сигнал подтверждён"),
+                               target_window_start=target_start)
+
+
+async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, candle,
+                       oi_data=None, confirm_note: str = "",
+                       target_window_start: float | None = None):
     import polymarket_trading as pt
 
     now = time.time()
     tf = c["liq_timeframe"]
-    slug = build_updown_slug(symbol, tf, now, offset_windows=1)
+    dur = TF_SECONDS.get(tf, 300)
+
+    # Целевое окно: то, что начинается сразу за сигнальной свечой. Передаём
+    # явно, потому что подтверждение приходит на самой границе окон и
+    # арифметика «текущее + 1» может промахнуться на целое окно.
+    if target_window_start:
+        win_start = int(target_window_start)
+    else:
+        win_start = int(_window_bounds(tf, now, offset_windows=1)[0])
+    win_end = win_start + dur
+    slug = f"{ASSET_MAP.get(symbol, 'btc')}-updown-{tf}-{win_start}"
+
+    if now >= win_end:
+        log.warning(f"liq_strategy: окно {slug} уже закрылось, пропускаю вход")
+        return
 
     info = pt.get_event_markets(slug)
     if not info or not info.get("markets"):
@@ -1658,8 +1950,8 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
                 pass
             return
 
-    _, window_end = _window_bounds(tf, now, 1)
-    start_next, _ = _window_bounds(tf, now, 1)
+    window_end = win_end
+    start_next = win_start
     # Сохраняем реальное имя события с Polymarket, чтобы статистика потом
     # корректно показывала «Bitcoin Up or Down» / «Ethereum Up or Down» и т.д.
     raw_q = m.get("question") if isinstance(m, dict) else None
@@ -1958,7 +2250,8 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
             f"━━━━ 📈 *POLYMARKET* ━━━━\n"
             f"📊 *Slug:* `{slug}`\n"
             f"🕐 *Окно:* {next_window_start} → {next_window_end} ({tf})\n"
-            f"{price_block}"
+            + (f"✅ {md_escape(confirm_note)}\n" if confirm_note else "")
+            + f"{price_block}"
             f"🎯 *Вход:* {entry_str} @ *{entry_cents}¢* → ставим *{outcome}*\n"
             f"💵 *Ставка:* `${stake_usd_final}` ({shares} shares) | "
             f"Потенциал *+${potential_profit}* (+{potential_roi_pct}%) при 100¢\n"
@@ -2215,7 +2508,9 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
         window_start = pos.get("window_start") or (pos["window_end"] - TF_SECONDS.get(c["liq_timeframe"], 300))
         wc = await get_window_candle(session, symbol, c["liq_timeframe"],
                                      window_start, force=True)
-        state_now = candle_state(wc)
+        # Правило рынка: close >= open → UP. Никакой зоны «дожи» тут быть
+        # не должно — Polymarket ничьих не знает.
+        state_now = resolve_state(wc)
         pos["last_candle_state"] = state_now or "FLAT"
         delta_pct = 0.0
         if wc and wc.get("open"):
@@ -2298,7 +2593,7 @@ async def _resolve_after_window(context, cid, session, c, state, symbol, pos):
 
     # 1. Свеча окна — ждём, пока она отметится закрытой
     wc = await get_window_candle(session, symbol, tf, window_start, force=True)
-    result = candle_state(wc) if (wc and wc.get("closed")) else None
+    result = resolve_state(wc) if (wc and wc.get("closed")) else None
     source = "свеча окна"
 
     # 2. Перепроверка/фолбэк по цене Polymarket
