@@ -40,6 +40,7 @@ import aiohttp
 
 import liq_api
 import chainlink_price as clp
+import orderflow as ofl
 from database import get_setting, set_setting, add_trade_history, get_trade_statistics
 
 log = logging.getLogger("bot.liq_strategy")
@@ -125,6 +126,21 @@ DEFAULTS = {
     # За сколько секунд до конца сигнальной свечи перепроверяем её
     # направление перед входом в следующее окно.
     "liq_entry_confirm_sec": "2",
+
+    # ===== ФИЛЬТРЫ БЕЗОТКАТНЫХ ДВИЖЕНИЙ (памп/дамп) =====
+    # 1) Импульс: сколько закрытых свечей подряд в одну сторону считать
+    #    безоткатным движением. 0 — фильтр выключен.
+    "liq_filter_impulse": "3",
+    #    ...и какое суммарное движение (%) при этом должно набраться,
+    #    чтобы признать движение импульсным.
+    "liq_filter_impulse_pct": "0.5",
+    # 2) Открытый интерес: если OI вырос на столько % за 5 минут вместе с
+    #    ценой — в рынок заходят новые деньги, а не выносят стопы.
+    #    0 — фильтр выключен.
+    "liq_filter_oi_pct": "0.4",
+    # 3) Поток ордеров: доля перекоса CVD (от 0 до 1), выше которой поток
+    #    считается односторонним и контр-трейд отменяется. 0 — выключено.
+    "liq_filter_cvd": "0.55",
 }
 
 MIN_SIZE_MODES = ("skip", "bump")
@@ -804,6 +820,46 @@ def _get_trade_stats(is_demo: int):
     }
 
 
+def _filters_detail_line(details: dict) -> str:
+    """Короткая сводка по фильтрам для сообщения."""
+    if not details:
+        return "Данных фильтров нет."
+    parts = []
+    if "oi_change_pct" in details:
+        parts.append(f"OI за 5м: {details['oi_change_pct']:+.2f}%")
+    if "cvd" in details:
+        parts.append(f"CVD окна: {details['cvd']:+,.0f}$ "
+                     f"(перекос {details.get('imbalance', 0) * 100:+.0f}%)")
+    if details.get("divergence"):
+        parts.append(f"дивергенция: {details['divergence']}")
+    if details.get("impulse") and details["impulse"] != "ок":
+        parts.append(details["impulse"])
+    return " | ".join(parts) if parts else "Данных фильтров нет."
+
+
+def _filters_status_line() -> str:
+    """Строка статуса: какие фильтры включены и живы ли их данные."""
+    streak = int(_f("liq_filter_impulse", 0))
+    oi_lim = _f("liq_filter_oi_pct", 0)
+    cvd_lim = _f("liq_filter_cvd", 0)
+
+    bits = []
+    bits.append(f"импульс {streak} св./{_f('liq_filter_impulse_pct', 0):.2f}%"
+                if streak > 0 else "импульс ⛔")
+    bits.append(f"OI +{oi_lim:.2f}%" if oi_lim > 0 else "OI ⛔")
+    if cvd_lim > 0:
+        try:
+            st = ofl.status()
+            mark = "🟢" if (st.get("connected") and st.get("age_sec") is not None
+                            and st["age_sec"] < 60) else "🔴"
+        except Exception:
+            mark = "❔"
+        bits.append(f"CVD {cvd_lim:.2f} {mark}")
+    else:
+        bits.append("CVD ⛔")
+    return "🛡 Фильтры памп/дампа: " + " | ".join(bits)
+
+
 def _candle_source_line() -> str:
     """Откуда берём свечи и живы ли данные Chainlink."""
     src = get_candle_source()
@@ -883,6 +939,7 @@ def get_status_text() -> str:
     lines.append(f"🔁 Чек: {c['liq_check_interval']}с | 👁 Скан: {c['liq_scan_interval']}с")
     lines.append(_candle_source_line())
     lines.append(f"⏳ Перепроверка свечи перед входом: за *{get_entry_confirm_sec()}с* до её закрытия")
+    lines.append(_filters_status_line())
     lines.append(_ws_status_line())
     lines.append("")
 
@@ -1429,6 +1486,7 @@ async def scan_for_signal(context):
     # Подписываем WS всех бирж (Bybit/Binance/Gate) на нужные монеты
     try:
         liq_api.set_symbols(symbols)
+        ofl.set_symbols(symbols)
     except Exception as e:
         log.debug(f"set_symbols err: {e}")
 
@@ -1686,6 +1744,177 @@ async def _register_pending(context, cid, session, c, state, symbol, outcome,
     )
 
 
+def _f(key, default=0.0) -> float:
+    try:
+        return float(get_setting(key, DEFAULTS[key]))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+async def get_recent_closed_candles(session, symbol: str, timeframe: str,
+                                    count: int) -> list:
+    """Последние закрытые свечи (Chainlink, при отсутствии — спот Gate.io)."""
+    if get_candle_source() == "chainlink":
+        try:
+            out = clp.get_recent_candles(symbol, timeframe, count)
+            if len(out) >= count:
+                return out
+        except Exception as e:
+            log.debug(f"chainlink recent candles err: {e}")
+
+    candles = await get_candles(session, symbol, timeframe,
+                                limit=count + 2, force=True)
+    closed = [c for c in candles if c.get("closed")]
+    return closed[-count:] if closed else []
+
+
+def _impulse_check(candles: list, outcome: str, min_streak: int,
+                   min_pct: float) -> tuple[bool, str]:
+    """Безоткатный памп/дамп: серия свечей в одну сторону без откатов.
+
+    Ставим мы всегда ПРОТИВ движения, поэтому опасна серия, направленная
+    против нашего входа: UP-серия при ставке DOWN и наоборот.
+    """
+    if min_streak <= 0 or len(candles) < min_streak:
+        return True, ""
+
+    trend = "UP" if outcome == "DOWN" else "DOWN"
+    tail = candles[-min_streak:]
+
+    for cndl in tail:
+        if resolve_state(cndl) != trend:
+            return True, ""
+
+    first_open = tail[0].get("open") or 0
+    last_close = tail[-1].get("close") or 0
+    if first_open <= 0:
+        return True, ""
+    move_pct = abs(last_close - first_open) / first_open * 100
+    if move_pct < min_pct:
+        return True, ""
+
+    # Насколько глубоко движение откатывалось внутри серии: если почти
+    # не откатывалось — это как раз «поезд без остановок».
+    span = abs(last_close - first_open)
+    pullback = 0.0
+    if trend == "UP":
+        peak = first_open
+        for cndl in tail:
+            peak = max(peak, cndl.get("high") or cndl.get("close") or peak)
+            low = cndl.get("low") or cndl.get("close") or peak
+            pullback = max(pullback, peak - low)
+    else:
+        trough = first_open
+        for cndl in tail:
+            trough = min(trough, cndl.get("low") or cndl.get("close") or trough)
+            high = cndl.get("high") or cndl.get("close") or trough
+            pullback = max(pullback, high - trough)
+
+    depth = (pullback / span) if span > 0 else 1.0
+    return False, (f"{min_streak} свечи подряд {trend} на {move_pct:.2f}% "
+                   f"без отката (макс. откат {depth * 100:.0f}% движения)")
+
+
+def _oi_check(oi_change_pct: float, outcome: str, limit_pct: float) -> tuple[bool, str]:
+    """Открытый интерес: растёт вместе с ценой → это не сквиз, а тренд.
+
+    Наш контр-трейд рассчитан на сквиз: цену двигают ликвидации, OI при
+    этом ПАДАЕТ (позиции закрываются). Если же OI растёт — в рынок
+    заходят новые деньги, откат ждать не стоит.
+    """
+    if limit_pct <= 0 or oi_change_pct is None:
+        return True, ""
+    if oi_change_pct >= limit_pct:
+        return False, (f"OI вырос на {oi_change_pct:+.2f}% за 5м — "
+                       f"заходят новые позиции, а не выносят стопы")
+    return True, ""
+
+
+def _cvd_check(symbol: str, outcome: str, t0: float, t1: float,
+               limit_ratio: float) -> tuple[bool, str, dict]:
+    """Поток ордеров: односторонняя агрессия против нас — не входим.
+
+    Исключение — дивергенция: если цена делает новый экстремум, а CVD за
+    ним не идёт, это абсорбция крупным лимитником, то есть как раз наш
+    сценарий разворота. Такой сигнал фильтр пропускает.
+    """
+    if limit_ratio <= 0:
+        return True, "", {}
+    try:
+        stats = ofl.flow_stats(symbol, t0, t1)
+    except Exception as e:
+        log.debug(f"cvd err: {e}")
+        return True, "", {}
+    if not stats or stats.get("trades", 0) < 30:
+        return True, "", {}
+
+    imb = stats["imbalance"]
+    try:
+        div = ofl.divergence(symbol, t0, t1)
+    except Exception:
+        div = None
+    stats["divergence"] = div
+
+    # Ставим DOWN → опасны агрессивные покупки (imb > 0), и наоборот.
+    against = imb if outcome == "DOWN" else -imb
+    if against >= limit_ratio:
+        if (outcome == "DOWN" and div == "BEAR_DIV") or \
+           (outcome == "UP" and div == "BULL_DIV"):
+            return True, "", stats
+        return False, (f"поток однонаправленный: CVD {stats['cvd']:+,.0f}$ "
+                       f"(перекос {against * 100:.0f}% в сторону движения), "
+                       f"дивергенции нет"), stats
+    return True, "", stats
+
+
+async def check_entry_filters(session, symbol: str, outcome: str, tf: str,
+                              signal_window_start: float,
+                              signal_window_end: float) -> tuple[bool, list, dict]:
+    """Фильтры безоткатных движений. Возвращает (можно_входить, причины, детали)."""
+    reasons = []
+    details = {}
+
+    # --- 1. Импульс по свечам ---
+    streak = int(_f("liq_filter_impulse", 0))
+    if streak > 0:
+        try:
+            candles = await get_recent_closed_candles(session, symbol, tf, streak)
+            okk, why = _impulse_check(candles, outcome, streak,
+                                      _f("liq_filter_impulse_pct", 0.5))
+            details["impulse"] = why or "ок"
+            if not okk:
+                reasons.append(why)
+        except Exception as e:
+            log.debug(f"impulse filter err: {e}")
+
+    # --- 2. Открытый интерес ---
+    oi_limit = _f("liq_filter_oi_pct", 0)
+    if oi_limit > 0:
+        try:
+            oi_chg = await liq_api.get_multi_oi_change(session, symbol)
+            avg = float((oi_chg or {}).get("average") or 0)
+            details["oi_change_pct"] = avg
+            okk, why = _oi_check(avg, outcome, oi_limit)
+            if not okk:
+                reasons.append(why)
+        except Exception as e:
+            log.debug(f"oi filter err: {e}")
+
+    # --- 3. Поток ордеров (CVD) ---
+    cvd_limit = _f("liq_filter_cvd", 0)
+    if cvd_limit > 0:
+        okk, why, stats = _cvd_check(symbol, outcome, signal_window_start,
+                                     signal_window_end, cvd_limit)
+        if stats:
+            details["cvd"] = round(stats.get("cvd", 0))
+            details["imbalance"] = round(stats.get("imbalance", 0), 3)
+            details["divergence"] = stats.get("divergence")
+        if not okk:
+            reasons.append(why)
+
+    return (not reasons), reasons, details
+
+
 async def process_pending(context):
     """Подтверждает или отменяет отложенные входы в конце сигнальной свечи."""
     if not is_active():
@@ -1771,7 +2000,7 @@ async def process_pending(context):
                 )
                 continue
 
-            # === Свеча подтвердилась — входим в следующее окно ===
+            # === Свеча подтвердилась — проверяем фильтры памп/дампа ===
             pending.pop(symbol, None)
             _save_state(state)
 
@@ -1779,6 +2008,27 @@ async def process_pending(context):
             if not allowed:
                 log.info(f"liq: {symbol} подтверждение есть, но вход закрыт: {why}")
                 continue
+
+            passed, reasons, details = await check_entry_filters(
+                session, symbol, outcome, tf, win_start, min(now, win_end))
+            if not passed:
+                log.info(f"liq: 🛑 {symbol} фильтр безоткатного движения: "
+                         f"{'; '.join(reasons)}")
+                set_setting(
+                    "liq_last_scan",
+                    f"[{symbol}] вход отменён фильтром: {reasons[0][:90]}",
+                )
+                await _send(
+                    context, cid,
+                    f"🛑 *Вход отменён фильтром* `{symbol}` {outcome}\n"
+                    + "\n".join(f"• {md_escape(r)}" for r in reasons)
+                    + f"\n\n{md_escape(_filters_detail_line(details))}"
+                    + "\n_Движение идёт без откатов — контр-трейд в такие "
+                      "моменты и даёт серии убытков._",
+                )
+                continue
+            if details:
+                log.info(f"liq: фильтры пройдены {symbol}: {details}")
 
             log.info(
                 f"liq: ✅ {symbol} свеча подтвердилась ({state_now}, "

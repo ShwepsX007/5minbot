@@ -444,6 +444,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 import liq_api as _la
                 _la.set_symbols(ls.get_selected_symbols())
+                import orderflow as _ofl
+                _ofl.set_symbols(ls.get_selected_symbols())
             except Exception as e:
                 log.debug(f"set_symbols err: {e}")
             return await q.edit_message_text(
@@ -457,6 +459,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 import liq_api as _la
                 _la.set_symbols(ls.get_selected_symbols())
+                import orderflow as _ofl
+                _ofl.set_symbols(ls.get_selected_symbols())
             except Exception as e:
                 log.debug(f"set_symbols err: {e}")
             return await q.edit_message_text(

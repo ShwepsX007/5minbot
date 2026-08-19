@@ -7,6 +7,7 @@ from config import TOKEN, BASE_DIR
 from database import init_db
 import liq_api
 import chainlink_price
+import orderflow
 from bot import cmd_start, on_text, on_callback, schedule_jobs
 
 log_path = os.path.join(BASE_DIR, "bot.log")
@@ -46,7 +47,9 @@ async def post_init(application):
     # подписаться до первого скана, а Binance не копил чужие символы.
     try:
         import liq_strategy as ls
-        liq_api.set_symbols(ls.get_selected_symbols())
+        symbols = ls.get_selected_symbols()
+        liq_api.set_symbols(symbols)
+        orderflow.set_symbols(symbols)
     except Exception as e:
         log.debug(f"set_symbols on startup failed: {e}")
 
@@ -57,6 +60,8 @@ async def post_init(application):
         # Цена, по которой Polymarket рассчитывает Up/Down: Chainlink TWAP
         # через публичный RTDS Polymarket (ключи не нужны).
         "chainlink_prices": chainlink_price.rtds_listener,
+        # Поток сделок Binance (aggTrade) для CVD-фильтра памп/дампа
+        "orderflow": orderflow.binance_aggtrade_listener,
     }
     tasks = []
     for name, factory in listeners.items():
@@ -86,6 +91,7 @@ async def post_shutdown(application):
         "binance_liquidations",
         "gate_liquidations",
         "chainlink_prices",
+        "orderflow",
     ):
         task = application.bot_data.pop(f"{name}_task", None)
         if task and task not in tasks:

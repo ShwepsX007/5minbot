@@ -303,6 +303,26 @@ def get_window_candle(symbol: str, window_start: float, window_end: float,
     }
 
 
+def get_recent_candles(symbol: str, timeframe: str, count: int,
+                       before_ts: float | None = None) -> list:
+    """Последние `count` ЗАКРЫТЫХ свечей окон (по возрастанию времени)."""
+    from_ts = before_ts or time.time()
+    dur = 300
+    if timeframe == "15m":
+        dur = 900
+    elif timeframe == "1h":
+        dur = 3600
+
+    cur_start = (int(from_ts) // dur) * dur
+    out = []
+    for i in range(count, 0, -1):
+        ws = cur_start - i * dur
+        cndl = get_window_candle(symbol, ws, ws + dur, timeframe)
+        if cndl:
+            out.append(cndl)
+    return out
+
+
 def have_data(symbol: str, timeframe: str = "5m") -> bool:
     sym = to_rtds_symbol(symbol)
     arr = _ticks.get((sym, twap_window_for(timeframe)))
