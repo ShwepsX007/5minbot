@@ -365,13 +365,14 @@ async def get_multi_oi(
         _get_gate_oi_usd(session, base_symbol),
         _get_bybit_oi_usd(session, f"{base}USDT"),
         _get_okx_oi_usd(session, base),
+        _get_binance_oi_usd(session, f"{base}USDT"),
         return_exceptions=True,
     )
 
     oi = {}
     total = 0
 
-    labels = ['Gate.io', 'Bybit', 'OKX']
+    labels = ['Gate.io', 'Bybit', 'OKX', 'Binance']
     for i, label in enumerate(labels):
         val = results[i]
         if isinstance(val, (int, float)) and val > 0:
@@ -452,6 +453,103 @@ async def _get_bybit_oi_usd(session, symbol):
         return 0
 
     return open_interest * mark_price
+
+
+async def _get_binance_oi_usd(session, symbol):
+    """Binance OI в долларах.
+
+    /fapi/v1/openInterest отдаёт OI в базовой монете (публичный, без
+    подписи), поэтому умножаем на markPrice из /fapi/v1/premiumIndex.
+    Если не вышло — берём готовое значение в USD из статистики
+    /futures/data/openInterestHist (обновляется раз в 5 минут).
+    """
+    oi_data = await fetch_json(
+        session, f"{BINANCE_FAPI}/fapi/v1/openInterest",
+        params={'symbol': symbol})
+
+    open_interest = 0.0
+    if isinstance(oi_data, dict):
+        try:
+            open_interest = float(oi_data.get('openInterest') or 0)
+        except (TypeError, ValueError):
+            open_interest = 0.0
+
+    if open_interest > 0:
+        mark_data = await fetch_json(
+            session, f"{BINANCE_FAPI}/fapi/v1/premiumIndex",
+            params={'symbol': symbol})
+        if isinstance(mark_data, list) and mark_data:
+            mark_data = mark_data[0]
+        if isinstance(mark_data, dict):
+            try:
+                mark = float(mark_data.get('markPrice') or 0)
+            except (TypeError, ValueError):
+                mark = 0.0
+            if mark > 0:
+                return open_interest * mark
+
+    # Фолбэк: сумма OI в долларах из статистики
+    hist = await fetch_json(
+        session, f"{BINANCE_FAPI}/futures/data/openInterestHist",
+        params={'symbol': symbol, 'period': '5m', 'limit': 1})
+    if isinstance(hist, list) and hist:
+        try:
+            return float(hist[-1].get('sumOpenInterestValue') or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+async def _get_binance_oi_change(session, symbol):
+    """Изменение OI за 5 минут в %.
+
+    /futures/data/openInterestHist — публичный эндпоинт статистики
+    (подпись не нужна), отдаёт записи от старых к новым.
+    """
+    data = await fetch_json(
+        session, f"{BINANCE_FAPI}/futures/data/openInterestHist",
+        params={'symbol': symbol, 'period': '5m', 'limit': 2})
+
+    if not isinstance(data, list) or len(data) < 2:
+        return None
+
+    try:
+        prev = float(data[0].get('sumOpenInterest') or 0)
+        curr = float(data[-1].get('sumOpenInterest') or 0)
+    except (TypeError, ValueError):
+        return None
+
+    if prev <= 0 or curr <= 0:
+        return None
+    return ((curr - prev) / prev) * 100
+
+
+async def _get_binance_lsr(session, symbol):
+    """Long/Short Ratio по счетам (публичная статистика Binance)."""
+    data = await fetch_json(
+        session, f"{BINANCE_FAPI}/futures/data/globalLongShortAccountRatio",
+        params={'symbol': symbol, 'period': '5m', 'limit': 1})
+    if not isinstance(data, list) or not data:
+        return None
+    try:
+        return float(data[-1].get('longShortRatio') or 0)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _get_binance_funding(session, symbol):
+    """Текущая ставка финансирования."""
+    data = await fetch_json(
+        session, f"{BINANCE_FAPI}/fapi/v1/premiumIndex",
+        params={'symbol': symbol})
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        return 0
+    try:
+        return float(data.get('lastFundingRate') or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 async def _get_okx_oi_usd(session, base):
@@ -1518,12 +1616,13 @@ async def get_multi_lsr(
         _get_gate_lsr(session, base_symbol),
         _get_bybit_lsr(session, f"{base}USDT"),
         _get_okx_lsr(session, base),
+        _get_binance_lsr(session, f"{base}USDT"),
         return_exceptions=True,
     )
 
     lsr = {}
     values = []
-    labels = ['Gate.io', 'Bybit', 'OKX']
+    labels = ['Gate.io', 'Bybit', 'OKX', 'Binance']
 
     for i, label in enumerate(labels):
         val = results[i]
@@ -1644,12 +1743,13 @@ async def get_multi_funding(
         _get_gate_funding(session, base_symbol),
         _get_bybit_funding(session, f"{base}USDT"),
         _get_okx_funding(session, base),
+        _get_binance_funding(session, f"{base}USDT"),
         return_exceptions=True,
     )
 
     funding = {}
     values = []
-    labels = ['Gate.io', 'Bybit', 'OKX']
+    labels = ['Gate.io', 'Bybit', 'OKX', 'Binance']
 
     for i, label in enumerate(labels):
         val = results[i]
@@ -1748,12 +1848,14 @@ async def get_multi_oi_change(
         _get_bybit_oi_change(
             session, f"{base}USDT"),
         _get_okx_oi_change(session, base),
+        _get_binance_oi_change(
+            session, f"{base}USDT"),
         return_exceptions=True,
     )
 
     changes = {}
     values = []
-    labels = ['Gate.io', 'Bybit', 'OKX']
+    labels = ['Gate.io', 'Bybit', 'OKX', 'Binance']
 
     for i, label in enumerate(labels):
         val = results[i]

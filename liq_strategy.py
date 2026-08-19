@@ -826,7 +826,12 @@ def _filters_detail_line(details: dict) -> str:
         return "Данных фильтров нет."
     parts = []
     if "oi_change_pct" in details:
-        parts.append(f"OI за 5м: {details['oi_change_pct']:+.2f}%")
+        by_ex = details.get("oi_by_exchange") or {}
+        if by_ex:
+            detail = ", ".join(f"{k} {v:+.2f}%" for k, v in sorted(by_ex.items()))
+            parts.append(f"OI за 5м: {details['oi_change_pct']:+.2f}% ({detail})")
+        else:
+            parts.append(f"OI за 5м: {details['oi_change_pct']:+.2f}%")
     if "cvd" in details:
         parts.append(f"CVD окна: {details['cvd']:+,.0f}$ "
                      f"(перекос {details.get('imbalance', 0) * 100:+.0f}%)")
@@ -1054,7 +1059,7 @@ def get_status_text() -> str:
             lines.append(f"   💪 Импакт: *{impact_pct:.3f}%* от OI ({_fmt_usd_compact(oi_total)}) — {impact_label}")
         if by_ex:
             lines.append(f"   📡 *По биржам:*")
-            for ex_name in ["Bybit", "Gate.io", "OKX"]:
+            for ex_name in ["Binance", "Bybit", "Gate.io", "OKX"]:
                 if ex_name not in by_ex:
                     continue
                 ex = by_ex[ex_name]
@@ -1064,7 +1069,7 @@ def get_status_text() -> str:
                 s_cnt = ex.get("short_count", 0)
                 lines.append(f"     • {md_escape(ex_name)}: ${l_usd+s_usd:,.0f} (L ${l_usd:,.0f} x{l_cnt} / S ${s_usd:,.0f} x{s_cnt})")
             for ex_name, ex in by_ex.items():
-                if ex_name in ["Bybit", "Gate.io", "OKX"]:
+                if ex_name in ["Binance", "Bybit", "Gate.io", "OKX"]:
                     continue
                 l_usd = ex.get("long_usd", 0)
                 s_usd = ex.get("short_usd", 0)
@@ -1894,6 +1899,10 @@ async def check_entry_filters(session, symbol: str, outcome: str, tf: str,
             oi_chg = await liq_api.get_multi_oi_change(session, symbol)
             avg = float((oi_chg or {}).get("average") or 0)
             details["oi_change_pct"] = avg
+            # Показываем разбивку по биржам — видно, кто именно набирает позиции
+            details["oi_by_exchange"] = {
+                k: v for k, v in (oi_chg or {}).items() if k != "average"
+            }
             okk, why = _oi_check(avg, outcome, oi_limit)
             if not okk:
                 reasons.append(why)
