@@ -14,6 +14,7 @@ PARAMS = [
     ("liq_min_size_usd", "🔎 Мин. размер ликвидации, $", ["500", "1000", "5000", "10000"]),
     ("liq_base_stake", "💵 Первый лот, $", ["1", "2", "5", "10"]),
     ("liq_martingale_mult", "✖️ Множитель мартингейла", ["1.5", "2", "2.5", "3"]),
+    ("liq_martingale_mode", "♻️ Схема мартингейла", ["recovery", "classic"]),
     ("liq_entry_mode", "🚀 Тип входа", ["market", "limit"]),
     ("liq_min_size_mode", "🚧 Лот меньше минимума рынка", ["skip", "bump"]),
     ("liq_candle_source", "📊 Источник свечи", ["chainlink", "gate_spot"]),
@@ -72,6 +73,21 @@ LIQ_PARAM_META = {
         "min": 1.1,
         "max": 10,
         "hint": "Множитель мартингейла. От 1.1 до 10. Пример: 2, 2.3",
+    },
+    "liq_martingale_mode": {
+        "type": "enum",
+        "allowed": ["recovery", "classic"],
+        "hint": (
+            "recovery — множитель применяется к ФАКТИЧЕСКОМУ долгу серии. "
+            "Досрочный выход по свече часто закрывается не в ноль: из $1 "
+            "возвращается 60¢, значит потеря 40¢ — её и отыгрываем "
+            "(0.40 x 2 = 0.80, а если это ниже минимума рынка, входим "
+            "минимальным лотом). Серия закрывается, как только суммарно "
+            "выходит в плюс.\n"
+            "classic — старая схема: первый лот x множитель^номер шага "
+            "(1, 2, 4, 8...), потери считаются как полная ставка.\n"
+            "Введи: recovery или classic"
+        ),
     },
     "liq_entry_mode": {
         "type": "enum",
@@ -252,6 +268,18 @@ def validate_manual_input(key: str, raw_text: str):
             return True, low.lower(), ""
         return False, "", f"❌ Допустимо только: {', '.join(allowed)}"
 
+    if key == "liq_martingale_mode":
+        low = text.lower().strip()
+        aliases = {
+            "recovery": "recovery", "рекавери": "recovery", "долг": "recovery",
+            "отыгрыш": "recovery", "r": "recovery", "новый": "recovery",
+            "classic": "classic", "классический": "classic", "классика": "classic",
+            "старый": "classic", "c": "classic",
+        }
+        if low in aliases:
+            return True, aliases[low], ""
+        return False, "", "❌ Введи: recovery (от долга серии) или classic (старая схема)"
+
     if key == "liq_candle_source":
         low = text.lower().strip()
         aliases = {
@@ -398,6 +426,8 @@ def param_index(key):
 _PRETTY_VALUE = {
     "market": "🚀 Рыночный",
     "limit":  "📋 Лимитный",
+    "recovery": "🧮 От долга серии",
+    "classic": "📐 Классический",
     "chainlink": "🔗 Chainlink TWAP",
     "gate_spot": "🟢 Спот Gate.io",
     "skip": "⏭ Пропускать вход",

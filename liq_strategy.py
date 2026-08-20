@@ -141,7 +141,16 @@ DEFAULTS = {
     # 3) Поток ордеров: доля перекоса CVD (от 0 до 1), выше которой поток
     #    считается односторонним и контр-трейд отменяется. 0 — выключено.
     "liq_filter_cvd": "0.55",
+
+    # Как считать ставку следующего шага серии:
+    #   "recovery" — от ФАКТИЧЕСКОГО долга серии: (сумма потерь − прибыли) ×
+    #                множитель. Если сделку закрыли не в ноль, а, например,
+    #                с −40% от ставки, отыгрываем именно эти 40%;
+    #   "classic"  — по старой схеме: первый лот × множитель^номер шага.
+    "liq_martingale_mode": "recovery",
 }
+
+MARTINGALE_MODES = ("recovery", "classic")
 
 MIN_SIZE_MODES = ("skip", "bump")
 CANDLE_SOURCES = ("chainlink", "gate_spot")
@@ -287,8 +296,8 @@ def set_param(key, value):
 
 # ===================== СОСТОЯНИЕ (ПЕРСИСТЕНТНОЕ) =====================
 def _empty_state() -> dict:
-    """Свежее состояние: серии, позиции и отложенные (неподтверждённые) входы."""
-    return {"series": {}, "positions": {}, "pending": {}}
+    """Свежее состояние: серии, позиции, отложенные входы и PnL серий."""
+    return {"series": {}, "positions": {}, "pending": {}, "series_pnl": {}}
 
 
 def _load_state() -> dict:
@@ -305,7 +314,8 @@ def _load_state() -> dict:
             old_sym = get_setting("liq_symbol", "") or "BTC_USDT"
             old_series = int(st.get("series", 0) or 0)
             old_pos = st.get("position")
-            new_st = {"series": {old_sym: old_series}, "positions": {}, "pending": {}}
+            new_st = {"series": {old_sym: old_series}, "positions": {},
+                      "pending": {}, "series_pnl": {}}
             if old_pos and isinstance(old_pos, dict):
                 # старая позиция была привязана к одной монете
                 sym = old_pos.get("symbol", old_sym)
@@ -315,6 +325,9 @@ def _load_state() -> dict:
         st.setdefault("series", {})
         st.setdefault("positions", {})
         st.setdefault("pending", {})
+        st.setdefault("series_pnl", {})
+        if not isinstance(st["series_pnl"], dict):
+            st["series_pnl"] = {}
         if not isinstance(st["series"], dict):
             st["series"] = {}
         if not isinstance(st["positions"], dict):
@@ -464,6 +477,56 @@ def sell_shares(pos: dict, shares: float, price_cents: int) -> tuple[bool, str, 
     except Exception as e:
         log.warning(f"liq: sell-market exception: {e}")
         return False, "market", None
+
+
+def get_martingale_mode() -> str:
+    v = str(get_setting("liq_martingale_mode",
+                        DEFAULTS["liq_martingale_mode"]) or "").strip().lower()
+    return v if v in MARTINGALE_MODES else "recovery"
+
+
+def get_series_pnl(state: dict, symbol: str) -> float:
+    """Накопленный результат текущей серии по монете ($, минус = долг)."""
+    try:
+        return round(float((state.get("series_pnl") or {}).get(symbol, 0) or 0), 4)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def series_debt(state: dict, symbol: str) -> float:
+    """Сколько денег серия должна отыграть ($, всегда >= 0)."""
+    pnl = get_series_pnl(state, symbol)
+    return round(-pnl, 4) if pnl < 0 else 0.0
+
+
+def compute_stake(c: dict, state: dict, symbol: str, series: int) -> tuple[float, str]:
+    """Ставка для шага серии. Возвращает (сумма, пояснение).
+
+    Режим "recovery" (по умолчанию): мартингейл применяется не к первому
+    лоту, а к ФАКТИЧЕСКОМУ долгу серии. Досрочный выход по свече часто
+    закрывается не в ноль: ставка $1 может вернуть 60¢, то есть потеря
+    всего 40¢. Умножать в таком случае целый доллар — значит грузить
+    серию втрое сильнее, чем нужно для выхода в плюс.
+
+    Режим "classic": прежняя схема base × mult^series.
+    """
+    base = float(c["liq_base_stake"])
+    mult = float(c["liq_martingale_mult"])
+    series = max(0, int(series or 0))
+
+    if series == 0:
+        return round(base, 4), "первый лот"
+
+    if get_martingale_mode() == "classic":
+        return round(base * (mult ** series), 4), f"классический ×{mult}^{series}"
+
+    debt = series_debt(state, symbol)
+    if debt <= 0:
+        # Долга нет (или серия уже в плюсе) — начинаем заново с базовой ставки
+        return round(base, 4), "долга нет — базовый лот"
+
+    stake = round(debt * mult, 4)
+    return stake, f"долг серии ${debt:.2f} ×{mult}"
 
 
 def get_min_size_mode() -> str:
@@ -938,6 +1001,9 @@ def get_status_text() -> str:
         _mc = 0.05 * float(c['liq_entry_price_cents'])
         min_lot_txt = (f"лимитный вход: минимум 5 долей = "
                        f"*${_mc:.2f}* при {c['liq_entry_price_cents']}¢")
+    mm = ("🧮 от долга серии" if get_martingale_mode() == "recovery"
+          else "📐 классический")
+    lines.append(f"♻️ Мартингейл: *{mm}*")
     lines.append(f"💵 Лот: *{c['liq_base_stake']}$* | ✖️ Мартин: *x{c['liq_martingale_mult']}* | 🎯 Лимит-цена: *{c['liq_entry_price_cents']}¢* | 🧮 Макс.серия: *{c['liq_max_series']}*")
     lines.append(f"🚧 {min_lot_txt} | если лот меньше: *{min_mode_txt}*")
     lines.append(f"🏁 TP: *{c['liq_tp_cents']}¢* | ⏰ Страховка: *{c['liq_new_order_time']}с* до конца окна | 🕘 В списке: *{c['liq_recent_count']}* сделок")
@@ -994,7 +1060,16 @@ def get_status_text() -> str:
                     lines.append(f"   💥 Каскад на входе: {agg_snap.get('dominant','?')} ${agg_snap.get('total_usd',0):,.0f} свеча {pos.get('candle','?')}")
                 lines.append(f"   🧠 Буфер: {buf} событий за 600с")
             else:
-                lines.append(f"{status_emoji} `{sym}` свободна | серия {ser}/{c['liq_max_series']} | буфер {buf} за 600с")
+                debt = series_debt(st, sym)
+                if ser > 0 or debt > 0:
+                    nxt, why = compute_stake(c, st, sym, max(ser, 1))
+                    lines.append(
+                        f"{status_emoji} `{sym}` свободна | серия {ser}/{c['liq_max_series']} "
+                        f"| долг {debt:.2f}$ → след. лот {nxt:.2f}$ ({md_escape(why)}) "
+                        f"| буфер {buf} за 600с"
+                    )
+                else:
+                    lines.append(f"{status_emoji} `{sym}` свободна | серия {ser}/{c['liq_max_series']} | буфер {buf} за 600с")
             lines.append("")
     else:
         lines.append("📭 *Не выбрано ни одной пары — открой ⚙️ Настройки.*")
@@ -2092,9 +2167,9 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
     token_id = m["token_yes"] if outcome == "UP" else m["token_no"]
 
     series = int((state.get("series") or {}).get(symbol, 0) or 0)
-    base_stake = float(c["liq_base_stake"])
-    mult = float(c["liq_martingale_mult"])
-    stake_usd = round(base_stake * (mult ** series), 4)
+    stake_usd, stake_why = compute_stake(c, state, symbol, series)
+    if series > 0:
+        log.info(f"liq_strategy: {symbol} шаг {series} — ставка {stake_usd}$ ({stake_why})")
 
     # === Выбор цены входа по режиму ===
     entry_mode = get_entry_mode()
@@ -2932,12 +3007,17 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     raw_q = pos.get("market_question_raw") or market_question or ""
     trade_question = _format_trade_question(symbol, raw_q)
 
+    pnl_map = state.setdefault("series_pnl", {})
+    prev_series_pnl = get_series_pnl(state, symbol)
+
     if win:
         # Потенциальный выигрыш: shares * (100 - entry_cents) / 100
         pnl = round(stake * (100 - entry_cents) / entry_cents, 2) if entry_cents > 0 else 0
         add_trade_history(is_demo_flag, slug, trade_question, outcome, "BUY",
                           pos.get("shares", stake), entry_cents, 100, pnl)
+        series_total = round(prev_series_pnl + pnl, 2)
         series_map[symbol] = 0
+        pnl_map.pop(symbol, None)
         positions_map.pop(symbol, None)
         _save_state(state)
         try:
@@ -2949,6 +3029,10 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
                 f"📈 `{slug}` {market_question[:60]}\n"
                 f"🎯 {outcome} закрыт по {close_price}¢ (вход {entry_cents}¢)\n"
                 f"💵 {stake}$ → +{pnl}$ | Серия {current_series}→0/{max_series}\n"
+                + (f"🧮 Итог серии: *{'+' if series_total >= 0 else ''}{series_total}$* "
+                   f"(до этого шага {prev_series_pnl:+.2f}$)\n"
+                   if current_series > 0 else "")
+                +
                 f"💥 Каскад на входе: {agg_snap.get('dominant','?')} ${agg_snap.get('total_usd',0):,.0f}\n"
                 + (f"🧭 {md_escape(reason)}\n" if reason else "")
                 +
@@ -2967,23 +3051,53 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     add_trade_history(is_demo_flag, slug, trade_question, outcome, "BUY",
                       shares_cnt, entry_cents, close_price, pnl)
 
+    # Накопленный результат серии с учётом этой сделки. Досрочный выход по
+    # свече часто закрывается не в ноль, поэтому долг серии — это НЕ сумма
+    # ставок, а фактическая разница между вложенным и полученным.
+    series_total = round(prev_series_pnl + pnl, 4)
+    pnl_map[symbol] = series_total
+
     next_series = current_series + 1
+
+    # Серия уже отыграна (например, «проигрышный» шаг закрылся в плюс и
+    # перекрыл прошлые потери) — закрываем её и ждём новый сигнал.
+    if series_total >= 0:
+        series_map[symbol] = 0
+        pnl_map.pop(symbol, None)
+        positions_map.pop(symbol, None)
+        _save_state(state)
+        log.info(f"liq: ✅ {symbol} серия отыграна, итог {series_total:+.2f}$ — закрываю")
+        try:
+            stats_after = _get_trade_stats(is_demo_flag)
+            await _send(
+                context, cid,
+                f"✅ *Серия закрыта в плюс* `{symbol}` {mode_emoji}\n"
+                f"📈 `{slug}` {outcome} закрыт по {close_price}¢ (вход {entry_cents}¢)\n"
+                f"💵 Шаг: {stake}$ → {pnl:+.2f}$ | Итог серии: *{series_total:+.2f}$*\n"
+                f"📊 {stats_after['total']} WR {stats_after['winrate']}% "
+                f"PnL {stats_after['total_pnl']}$\n"
+                f"Жду новый каскад по `{symbol}`",
+            )
+        except Exception as e:
+            log.warning(f"settle series_recovered msg err: {e}")
+        return
 
     if next_series > max_series:
         # Серия полностью слита — сбрасываем по этой монете
         series_map[symbol] = 0
+        pnl_map.pop(symbol, None)
         positions_map.pop(symbol, None)
         _save_state(state)
         try:
             stats_after = _get_trade_stats(is_demo_flag)
             c_base = float(c["liq_base_stake"])
             c_mult = float(c["liq_martingale_mult"])
-            series_loss_est = round(sum([c_base * (c_mult ** i) for i in range(max_series + 1)]), 2) if c_mult != 1 else round(c_base * (max_series + 1), 2)
+            series_loss_est = abs(series_total)
             tag = "⏰ ДОСРОЧНО" if early_exit else "🏁 В СРОК"
             msg = (
                 f"🛑 *СЕРИЯ СЛИТА* `{symbol}` ({max_series+1} шагов) {tag} {mode_emoji}\n"
                 f"📈 `{slug}` {outcome} закрыт по {close_price}¢ (вход {entry_cents}¢)\n"
-                f"💵 {stake}$ → {pnl}$ | Убыток серии ~ -{series_loss_est}$\n"
+                f"💵 {stake}$ → {pnl}$ | Фактический убыток серии: -{series_loss_est:.2f}$\n"
                 f"📊 Всего {stats_after['total']} WR {stats_after['winrate']}% PnL {stats_after['total_pnl']}$\n"
                 f"Жду новый каскад по `{symbol}`"
             )
@@ -3001,12 +3115,12 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     positions_map.pop(symbol, None)
     _save_state(state)
 
-    c_base = float(c["liq_base_stake"])
     c_mult = float(c["liq_martingale_mult"])
-    next_stake = round(c_base * (c_mult ** next_series), 2)
+    next_stake, stake_why = compute_stake(c, state, symbol, next_series)
+    next_stake = round(next_stake, 2)
     next_potential = round(next_stake * (100 - entry_cents) / entry_cents, 2)
     log.info(f"liq: ♻️ {symbol} серия {current_series}→{next_series}/{max_series}, "
-             f"следующая ставка {next_stake}$ (×{c_mult}) — планирую вход")
+             f"долг {abs(series_total):.2f}$, следующая ставка {next_stake}$ ({stake_why})")
 
     # Отправляем сообщение о проигрыше
     try:
@@ -3015,8 +3129,11 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
         msg = (
             f"🔴 *ШАГ ПРОИГРАН* `{symbol}` {tag} {mode_emoji}\n"
             f"📈 `{slug}` {outcome} закрыт по {close_price}¢ (вход {entry_cents}¢)\n"
-            f"💵 {stake}$ → {pnl}$ | Серия {current_series}→{next_series}/{max_series}\n"
-            f"♻️ След: {next_stake}$ ×{c_mult} @ {entry_cents}¢ (потенциал +{next_potential}$)\n"
+            f"💵 {stake}$ → {pnl:+.2f}$ | Серия {current_series}→{next_series}/{max_series}\n"
+            f"🧮 Долг серии: *{abs(series_total):.2f}$* "
+            f"(вложено не {stake}$, а фактическая разница)\n"
+            f"♻️ След: *{next_stake}$* — {md_escape(stake_why)} "
+            f"@ {entry_cents}¢ (потенциал +{next_potential}$)\n"
             + (f"🧭 {md_escape(reason)}\n" if reason else "")
             +
             f"📊 {stats_after['total']} WR {stats_after['winrate']}% PnL {stats_after['total_pnl']}$\n"
@@ -3134,6 +3251,17 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
     market_info = pt.get_market_info(token_id)
     plan = plan_order(stake_usd, entry_cents, market_info, order_kind=entry_mode)
     min_mode = get_min_size_mode()
+
+    # В восстановительном режиме ставка нарочно маленькая (отыгрываем только
+    # фактический долг). Пропускать из-за этого шаг нельзя — серия оборвётся,
+    # поэтому заходим минимально допустимым размером.
+    if plan["below_min"] and get_martingale_mode() == "recovery":
+        min_mode = "bump"
+        log.info(
+            f"liq: мартингейл {symbol} шаг {series} — расчётная ставка "
+            f"${stake_usd:.2f} ниже минимума рынка, вхожу минимальным "
+            f"размером ${plan['min_cost']:.2f}"
+        )
 
     if plan["below_min"] and min_mode == "skip":
         log.warning(
