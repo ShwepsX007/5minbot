@@ -211,7 +211,15 @@ DEFAULTS = {
     #                с −40% от ставки, отыгрываем именно эти 40%;
     #   "classic"  — по старой схеме: первый лот × множитель^номер шага.
     "liq_martingale_mode": "recovery",
+
+    # Какую свечу считать сигнальной:
+    #   "current" — та, ВНУТРИ которой прошёл каскад ликвидаций (окно ещё
+    #               идёт). Её же бот перепроверяет перед входом;
+    #   "prev"    — последняя полностью закрытая свеча.
+    "liq_signal_candle": "current",
 }
+
+SIGNAL_CANDLE_BASIS = ("current", "prev")
 
 MARTINGALE_MODES = ("recovery", "classic")
 
@@ -544,6 +552,12 @@ def sell_shares(pos: dict, shares: float, price_cents: int) -> tuple[bool, str, 
     except Exception as e:
         log.warning(f"liq: sell-market exception: {e}")
         return False, "market", None
+
+
+def get_signal_candle_basis() -> str:
+    v = str(get_setting("liq_signal_candle",
+                        DEFAULTS["liq_signal_candle"]) or "").strip().lower()
+    return v if v in SIGNAL_CANDLE_BASIS else "current"
 
 
 def get_martingale_mode() -> str:
@@ -1076,7 +1090,10 @@ def get_status_text() -> str:
     lines.append(f"🏁 TP: *{c['liq_tp_cents']}¢* | ⏰ Страховка: *{c['liq_new_order_time']}с* до конца окна | 🕘 В списке: *{c['liq_recent_count']}* сделок")
     lines.append(f"🔁 Чек: {c['liq_check_interval']}с | 👁 Скан: {c['liq_scan_interval']}с")
     lines.append(_candle_source_line())
-    lines.append(f"⏳ Перепроверка свечи перед входом: за *{get_entry_confirm_sec()}с* до её закрытия")
+    _sb = ("🕯 свеча ликвидаций (текущее окно)" if get_signal_candle_basis() == "current"
+           else "⏮ предыдущая закрытая свеча")
+    lines.append(f"🕯 Сигнальная свеча: *{_sb}*")
+    lines.append(f"⏳ Перепроверка её направления: за *{get_entry_confirm_sec()}с* до закрытия окна")
     lines.append(_filters_status_line())
     lines.append(_funnel_line())
     _lf = _last_filters_line()
@@ -1750,7 +1767,19 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
     # 4. Свеча и OI (информативно)
     # Сохраняем источник свечи в кэш (gateio_spot / gateio_fut), чтобы
     # показать пользователю в логах и сообщении — откуда бот взял цену.
-    candle = await get_candle_direction(session, symbol, tf)
+    # ВАЖНО: сигнальной считается та свеча, ВНУТРИ которой прошёл каскад,
+    # то есть текущее (ещё не закрытое) окно. Раньше здесь бралась
+    # предыдущая ЗАКРЫТАЯ свеча, а перед входом перепроверялось текущее
+    # окно — сравнивались две разные свечи, и вход отменялся почти всегда:
+    # «на сигнале была UP» относилось к прошлой свече, а «закрылась DOWN» —
+    # уже к свече с ликвидациями.
+    signal_basis = get_signal_candle_basis()
+    sig_win_start, sig_win_end = _window_bounds(tf, time.time(), 0)
+    cur_candle = await get_window_candle(session, symbol, tf, sig_win_start,
+                                         force=True)
+    cur_state = candle_state(cur_candle)
+    prev_state = await get_candle_direction(session, symbol, tf)
+    candle = cur_state if signal_basis == "current" else prev_state
     # Имя источника — берём из кэша (если есть) для диагностики
     candle_src = ""
     try:
@@ -1769,7 +1798,12 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
     # Сохраняем источник цены свечи в agg для последующего логирования
     # Делаем это ВСЕГДА (даже если свеча doji и candle=None), чтобы в
     # сообщениях и логах пользователь видел, откуда была взята цена.
+    if cur_candle and cur_candle.get("src"):
+        candle_src = cur_candle["src"]
     agg["_candle_src"] = candle_src or "none"
+    agg["_candle_basis"] = signal_basis
+    agg["_cur_candle_state"] = cur_state or "FLAT"
+    agg["_prev_candle_state"] = prev_state or "FLAT"
 
     oi_data = {}
     try:
@@ -1899,6 +1933,7 @@ async def _register_pending(context, cid, session, c, state, symbol, outcome,
         "symbol": symbol,
         "outcome": outcome,
         "signal_candle": candle,          # направление на момент сигнала
+        "signal_basis": get_signal_candle_basis(),
         "signal_window_start": win_start,
         "signal_window_end": win_end,
         "created_ts": now,
@@ -1915,10 +1950,16 @@ async def _register_pending(context, cid, session, c, state, symbol, outcome,
         f"liq: ⏸ {symbol} сигнал {agg['dominant']} свеча {candle} → {outcome}; "
         f"жду конца свечи ({left}с) для перепроверки"
     )
+    basis = get_signal_candle_basis()
+    win_txt = (f"{datetime.fromtimestamp(win_start, tz=timezone.utc).strftime('%H:%M')}"
+               f"–{datetime.fromtimestamp(win_end, tz=timezone.utc).strftime('%H:%M')} UTC")
+    candle_txt = (f"свеча ликвидаций ({win_txt}) сейчас *{candle}*"
+                  if basis == "current"
+                  else f"предыдущая закрытая свеча *{candle}*")
     await _send(
         context, cid,
         f"⏸ *Сигнал принят, ждём конца свечи* `{symbol}`\n"
-        f"💥 Каскад: *{agg['dominant']}* ${agg['total_usd']:,.0f} | свеча сейчас *{candle}*\n"
+        f"💥 Каскад: *{agg['dominant']}* ${agg['total_usd']:,.0f} | {candle_txt}\n"
         f"🎯 План: войти *{outcome}* в следующее окно\n"
         f"⏳ Перепроверю направление свечи за {get_entry_confirm_sec()}с до её закрытия "
         f"(осталось {left}с). Если свеча перекрасится — вход отменю.",
@@ -2175,27 +2216,46 @@ async def _process_pending_impl(context):
                             f"для перепроверки.")
                 continue
 
-            # === Свеча перекрасилась — откат уже случился, входить поздно ===
-            if state_now != signal_candle:
+            # === Проверка: не случился ли откат раньше времени ===
+            # Сравниваем ТУ ЖЕ свечу, по которой принят сигнал.
+            basis = req.get("signal_basis") or "current"
+            if basis == "current":
+                # Сигнал был по свече ликвидаций: отменяем, если она
+                # закрылась в другую сторону, чем на момент каскада.
+                cancel = (state_now != signal_candle)
+                cancel_txt = (
+                    f"🕯 Свеча ликвидаций закрылась *{state_now}* "
+                    f"({delta_pct:+.3f}%), а во время каскада была *{signal_candle}*\n"
+                    f"↩️ Откат, ради которого мы шли в *{outcome}*, уже произошёл "
+                    f"внутри этой же свечи — следующее окно пропускаем."
+                )
+                log_txt = (f"свеча ликвидаций перекрасилась {signal_candle} → "
+                           f"{state_now}")
+            else:
+                # Сигнал был по предыдущей закрытой свече. Тогда отменяем,
+                # если свеча ликвидаций уже сходила в нашу сторону —
+                # разворот отыгран без нас.
+                cancel = (state_now == outcome)
+                cancel_txt = (
+                    f"🕯 Свеча ликвидаций закрылась *{state_now}* "
+                    f"({delta_pct:+.3f}%) — это уже наша сторона (*{outcome}*)\n"
+                    f"↩️ Разворот отыгран внутри неё, следующее окно пропускаем."
+                )
+                log_txt = (f"откат уже внутри свечи ликвидаций "
+                           f"({state_now} = наш {outcome})")
+
+            if cancel:
                 pending.pop(symbol, None)
                 _save_state(state)
                 _bump_stat("liq_stat_candle_cancel")
-                log.info(
-                    f"liq: 🚫 {symbol} свеча перекрасилась {signal_candle} → "
-                    f"{state_now} ({delta_pct:+.3f}%, {src}) — вход {outcome} отменён"
-                )
+                log.info(f"liq: 🚫 {symbol} {log_txt} ({delta_pct:+.3f}%, {src}) "
+                         f"— вход {outcome} отменён")
                 set_setting(
                     "liq_last_scan",
-                    f"[{symbol}] свеча перекрасилась {signal_candle}→{state_now} — вход отменён",
+                    f"[{symbol}] {log_txt} — вход отменён",
                 )
-                await _send(
-                    context, cid,
-                    f"🚫 *Вход отменён* `{symbol}`\n"
-                    f"🕯 Свеча ликвидаций закрылась *{state_now}* "
-                    f"({delta_pct:+.3f}%), а на сигнале была *{signal_candle}*\n"
-                    f"↩️ Откат, ради которого мы шли в *{outcome}*, уже произошёл "
-                    f"внутри этой же свечи — следующее окно пропускаем.",
-                )
+                await _send(context, cid,
+                            f"🚫 *Вход отменён* `{symbol}`\n" + cancel_txt)
                 continue
 
             # === Свеча подтвердилась — проверяем фильтры памп/дампа ===
@@ -2248,14 +2308,15 @@ async def _process_pending_impl(context):
             log.info(f"liq: фильтры пройдены {symbol}: {details or 'все выключены'}")
 
             log.info(
-                f"liq: ✅ {symbol} свеча подтвердилась ({state_now}, "
-                f"{delta_pct:+.3f}%, {src}) — вхожу {outcome}"
+                f"liq: ✅ {symbol} свеча ликвидаций закрылась {state_now} "
+                f"({delta_pct:+.3f}%, {src}), сигнал по «{basis}» подтверждён "
+                f"— вхожу {outcome}"
             )
             state = _load_state()
             await _enter_trade(context, cid, session, c, state, symbol,
                                outcome, req.get("agg") or {}, signal_candle,
                                req.get("oi") or {},
-                               confirm_note=(f"свеча закрылась {state_now} "
+                               confirm_note=(f"свеча ликвидаций закрылась {state_now} "
                                              f"({delta_pct:+.3f}%) — сигнал подтверждён"),
                                target_window_start=target_start)
 

@@ -18,6 +18,7 @@ PARAMS = [
     ("liq_entry_mode", "🚀 Тип входа", ["market", "limit"]),
     ("liq_min_size_mode", "🚧 Лот меньше минимума рынка", ["skip", "bump"]),
     ("liq_candle_source", "📊 Источник свечи", ["chainlink", "gate_spot"]),
+    ("liq_signal_candle", "🕯 Сигнальная свеча", ["current", "prev"]),
     ("liq_entry_confirm_sec", "⏳ Перепроверка свечи за N сек", ["1", "2", "3", "5"]),
     ("liq_filter_impulse", "🛡 Импульс: свечей подряд", ["0", "2", "3", "4"]),
     ("liq_filter_impulse_pct", "🛡 Импульс: движение, %", ["0.3", "0.5", "0.8", "1.2"]),
@@ -113,6 +114,20 @@ LIQ_PARAM_META = {
             "bump — входить минимально возможным размером рынка (лот может "
             "оказаться больше заданного).\n"
             "Введи: skip или bump"
+        ),
+    },
+    "liq_signal_candle": {
+        "type": "enum",
+        "allowed": ["current", "prev"],
+        "hint": (
+            "Какую свечу бот считает сигнальной.\n"
+            "current — свеча, ВНУТРИ которой прошёл каскад ликвидаций "
+            "(окно ещё идёт). Её же бот перепроверяет перед входом: если к "
+            "закрытию она перекрасилась — откат случился без нас, вход "
+            "отменяется. Рекомендуется.\n"
+            "prev — последняя полностью закрытая свеча. Тогда перед входом "
+            "проверяется, не ушла ли свеча ликвидаций уже в нашу сторону.\n"
+            "Введи: current или prev"
         ),
     },
     "liq_candle_source": {
@@ -280,6 +295,18 @@ def validate_manual_input(key: str, raw_text: str):
             return True, aliases[low], ""
         return False, "", "❌ Введи: recovery (от долга серии) или classic (старая схема)"
 
+    if key == "liq_signal_candle":
+        low = text.lower().strip()
+        aliases = {
+            "current": "current", "текущая": "current", "ликвидаций": "current",
+            "тек": "current", "c": "current",
+            "prev": "prev", "предыдущая": "prev", "пред": "prev",
+            "закрытая": "prev", "p": "prev",
+        }
+        if low in aliases:
+            return True, aliases[low], ""
+        return False, "", "❌ Введи: current (свеча ликвидаций) или prev (предыдущая закрытая)"
+
     if key == "liq_candle_source":
         low = text.lower().strip()
         aliases = {
@@ -428,6 +455,8 @@ _PRETTY_VALUE = {
     "limit":  "📋 Лимитный",
     "recovery": "🧮 От долга серии",
     "classic": "📐 Классический",
+    "current": "🕯 Свеча ликвидаций",
+    "prev": "⏮ Предыдущая закрытая",
     "chainlink": "🔗 Chainlink TWAP",
     "gate_spot": "🟢 Спот Gate.io",
     "skip": "⏭ Пропускать вход",
