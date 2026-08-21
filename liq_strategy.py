@@ -46,6 +46,15 @@ from database import get_setting, set_setting, add_trade_history, get_trade_stat
 log = logging.getLogger("bot.liq_strategy")
 
 
+# Взаимное исключение тиков. Джоб слежения за позицией ходит раз в 1-2
+# секунды, а один проход теперь может занять дольше (запросы OI, фильтры,
+# отправка ордера). Без защиты тики накладываются друг на друга и одна и
+# та же позиция обрабатывается дважды: один проход закрывает её как
+# «серия в плюс», второй — как «шаг проигран».
+_signal_lock = asyncio.Lock()
+_position_lock = asyncio.Lock()
+_pending_lock = asyncio.Lock()
+
 _MD_SPECIALS = ("_", "*", "`", "[", "]")
 
 
@@ -1542,6 +1551,15 @@ def seconds_left_in_window(timeframe: str, now_ts: float) -> float:
 
 # ===================== ОСНОВНОЙ ЦИКЛ =====================
 async def scan_for_signal(context):
+    """Тик поиска сигнала (не наслаивается на предыдущий)."""
+    if _signal_lock.locked():
+        log.debug("scan_for_signal: предыдущий проход ещё идёт, пропускаю тик")
+        return
+    async with _signal_lock:
+        await _scan_for_signal_impl(context)
+
+
+async def _scan_for_signal_impl(context):
     """
     Сканируем каждую выбранную монету.
 
@@ -1599,6 +1617,15 @@ async def scan_for_signal(context):
 
 
 async def scan_open_position(context):
+    """Тик слежения за позициями (не наслаивается на предыдущий)."""
+    if _position_lock.locked():
+        log.debug("scan_open_position: предыдущий проход ещё идёт, пропускаю тик")
+        return
+    async with _position_lock:
+        await _scan_open_position_impl(context)
+
+
+async def _scan_open_position_impl(context):
     """Проверяем все открытые позиции и отложенные входы (по всем монетам)."""
     if not is_active():
         return
@@ -1793,6 +1820,17 @@ async def _register_pending(context, cid, session, c, state, symbol, outcome,
     tf = c["liq_timeframe"]
     now = time.time()
     win_start, win_end = _window_bounds(tf, now, 0)
+
+    # Перечитываем состояние: между началом прохода по монетам и этим
+    # моментом другой цикл мог открыть позицию или закрыть серию. Запись
+    # устаревшей копии затирала бы чужие изменения.
+    state = _load_state()
+    if symbol in (state.get("positions") or {}):
+        log.info(f"liq: {symbol} уже есть позиция — отложенный вход не ставлю")
+        return
+    if symbol in (state.get("pending") or {}):
+        log.info(f"liq: {symbol} уже в очереди на подтверждение")
+        return
 
     pending = state.setdefault("pending", {})
     pending[symbol] = {
@@ -2000,7 +2038,19 @@ async def check_entry_filters(session, symbol: str, outcome: str, tf: str,
 
 
 async def process_pending(context):
-    """Подтверждает или отменяет отложенные входы в конце сигнальной свечи."""
+    """Подтверждает или отменяет отложенные входы в конце сигнальной свечи.
+
+    Вызывается из обоих джобов, поэтому обязателен свой лок: иначе один и
+    тот же отложенный вход обрабатывается дважды и уходят два ордера.
+    """
+    if _pending_lock.locked():
+        log.debug("process_pending: уже выполняется, пропускаю")
+        return
+    async with _pending_lock:
+        await _process_pending_impl(context)
+
+
+async def _process_pending_impl(context):
     if not is_active():
         return
     state = _load_state()
@@ -2312,13 +2362,16 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
         "oi_snapshot": oi_data or {},
         "market_question_raw": raw_q or "",
     }
-    # Доп. защита: если у этой монеты уже есть открытая позиция (гонка задач),
-    # не открываем вторую.
+    # Доп. защита: перечитываем состояние прямо перед записью — между
+    # проверкой и этим моментом были сетевые вызовы, за которые другой
+    # цикл мог открыть позицию по этой же монете.
+    state = _load_state()
     state.setdefault("positions", {})
     if symbol in state["positions"]:
         log.warning(f"liq_strategy: гонка — у {symbol} уже есть позиция, пропускаю")
         return
     state["positions"][symbol] = pos
+    (state.setdefault("pending", {})).pop(symbol, None)
     _save_state(state)
 
     # Заранее готовим URL для сообщения и fallback
@@ -2995,6 +3048,13 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     is_demo_flag = pos.get("is_demo", 0)
     mode_emoji = "🎮 ДЕМО" if is_demo_flag else "💰 РЕАЛ"
     current_series = int(pos.get("series", 0) or 0)
+
+    # Свежее состояние + защита от повторного расчёта одной и той же
+    # позиции: если её уже закрыл другой проход, молча выходим.
+    state = _load_state()
+    if symbol not in (state.get("positions") or {}):
+        log.info(f"liq: {symbol} позиция уже закрыта другим проходом, пропускаю расчёт")
+        return
     series_map = state.setdefault("series", {})
     positions_map = state.setdefault("positions", {})
     entry_cents = pos["entry_cents"]
@@ -3192,6 +3252,11 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
     import polymarket_trading as pt
 
     now = time.time()
+    state = _load_state()
+    if symbol in (state.get("positions") or {}):
+        log.warning(f"liq: мартингейл {symbol} — позиция уже открыта, пропускаю шаг")
+        return
+
     # Если текущее окно только началось (например, мы дождались расчёта
     # предыдущего) — заходим в него, иначе ждём следующее.
     offset = pick_entry_window(tf, now)
@@ -3340,7 +3405,11 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
         "open_ts": now, "oi_snapshot": {},
         "market_question_raw": raw_q or "",
     }
-    state["positions"][symbol] = pos
+    state = _load_state()
+    if symbol in (state.get("positions") or {}):
+        log.warning(f"liq: мартингейл {symbol} — гонка, позиция уже есть")
+        return
+    state.setdefault("positions", {})[symbol] = pos
     _save_state(state)
 
     log.info(f"liq: ✅ МАРТИНГЕЙЛ {symbol} шаг {series} вход {entry_cents}¢ "

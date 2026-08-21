@@ -882,6 +882,28 @@ async def job_liq_position(context: ContextTypes.DEFAULT_TYPE):
         log.exception(f"job_liq_position error: {e}")
 
 
+# Фоновые задачи ГЛОБАЛЬНЫЕ: стратегия одна на весь бот (состояние лежит в
+# БД), поэтому и сканеров должно быть по одному. Раньше имена содержали
+# chat_id, и при нескольких админах (или /start в личке и в группе) на одну
+# стратегию работало несколько копий джобов — отсюда дубли сообщений,
+# двойные входы и «серия закрыта» одновременно с «шаг проигран».
+STRATEGY_JOB_NAMES = ("mk_job", "liq_signal_job", "liq_position_job")
+
+
+def _remove_strategy_jobs(jq):
+    """Снимает все экземпляры фоновых задач, включая старые имена с chat_id."""
+    for name in STRATEGY_JOB_NAMES:
+        for j in jq.get_jobs_by_name(name):
+            j.schedule_removal()
+    try:
+        for j in jq.jobs():
+            nm = j.name or ""
+            if any(nm.startswith(p + ":") for p in STRATEGY_JOB_NAMES):
+                j.schedule_removal()
+    except Exception as e:
+        log.debug(f"job cleanup err: {e}")
+
+
 def schedule_jobs(context, cid=None):
     jq = getattr(context, "job_queue", None) or getattr(context, "application", None) and context.application.job_queue
     if not jq:
@@ -889,10 +911,10 @@ def schedule_jobs(context, cid=None):
 
     if not cid:
         return
-    names = [f"{prefix}:{cid}" for prefix in ("mk_job", "liq_signal_job", "liq_position_job")]
-    for name in names:
-        for j in jq.get_jobs_by_name(name):
-            j.schedule_removal()
+
+    _remove_strategy_jobs(jq)
+    names = list(STRATEGY_JOB_NAMES)
+    log.info(f"Фоновые задачи перевешены на чат {cid}")
 
     mi = int(get_setting("m_interval", "30"))
     jq.run_repeating(job_markets, interval=mi, first=15, name=names[0], data={"cid": cid})

@@ -73,14 +73,23 @@ async def post_init(application):
 
     # Schedule background jobs for every admin. schedule_jobs is safe
     # to call multiple times — it removes existing jobs by name first.
+    # ВАЖНО: задачи планируются ОДИН раз, а не на каждого админа. Стратегия
+    # одна на весь бот, и несколько наборов джобов означали бы несколько
+    # параллельных сканеров одного состояния (дубли сообщений и сделок).
+    # Уведомления идут в чат первого админа; после /start в другом чате
+    # schedule_jobs перевесит их туда.
     from config import ADMIN_CHAT_IDS
     from bot import schedule_jobs
-    for admin_id in ADMIN_CHAT_IDS:
+    admins = sorted(ADMIN_CHAT_IDS)
+    if admins:
         try:
-            schedule_jobs(application, admin_id)
-            log.info(f"Background jobs scheduled for admin {admin_id}")
+            schedule_jobs(application, admins[0])
+            log.info(f"Background jobs scheduled once, notifications → {admins[0]}")
+            if len(admins) > 1:
+                log.info(f"Остальные админы ({len(admins) - 1}) управляют ботом, "
+                         f"но своих копий задач не получают")
         except Exception as e:
-            log.exception(f"Failed to schedule jobs for admin {admin_id}: {e}")
+            log.exception(f"Failed to schedule jobs: {e}")
 
 
 async def post_shutdown(application):
