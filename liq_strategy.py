@@ -72,6 +72,60 @@ def md_escape(text) -> str:
     return out
 
 
+# ===== Воронка сигналов (счётчики для диагностики) =====
+# Отвечают на вопрос «фильтры вообще работают?»: видно, сколько сигналов
+# принято, сколько отсеяла перепроверка свечи, сколько — каждый фильтр,
+# и сколько дошло до входа.
+STAT_KEYS = (
+    "liq_stat_signals",        # сигналов принято в очередь
+    "liq_stat_candle_cancel",  # отменено перепроверкой свечи
+    "liq_stat_filter_impulse",  # отменено фильтром импульса
+    "liq_stat_filter_oi",      # отменено фильтром OI
+    "liq_stat_filter_cvd",     # отменено фильтром потока
+    "liq_stat_entries",        # реальных входов
+)
+
+
+def _stat(key) -> int:
+    try:
+        return int(float(get_setting(key, "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bump_stat(key, n: int = 1):
+    try:
+        set_setting(key, str(_stat(key) + n))
+    except Exception as e:
+        log.debug(f"stat {key} err: {e}")
+
+
+def reset_stats():
+    for k in STAT_KEYS:
+        set_setting(k, "0")
+    set_setting("liq_last_filters", "")
+
+
+def _funnel_line() -> str:
+    sig = _stat("liq_stat_signals")
+    if not sig:
+        return ("🔻 Воронка сигналов: пока пусто — как появятся сигналы, "
+                "здесь будет видно работу фильтров")
+    cc = _stat("liq_stat_candle_cancel")
+    fi = _stat("liq_stat_filter_impulse")
+    fo = _stat("liq_stat_filter_oi")
+    fc = _stat("liq_stat_filter_cvd")
+    ent = _stat("liq_stat_entries")
+    return (f"🔻 Воронка: сигналов *{sig}* → свеча отсеяла *{cc}* → "
+            f"фильтры *{fi + fo + fc}* (импульс {fi} / OI {fo} / CVD {fc}) → "
+            f"входов *{ent}*")
+
+
+def _last_filters_line() -> str:
+    raw = get_setting("liq_last_filters", "")
+    return f"🔎 Последняя проверка фильтров: {md_escape(raw)}" if raw else ""
+
+
 async def _send(context, cid, text, **kwargs):
     """Отправка сообщения с откатом на обычный текст.
 
@@ -353,8 +407,12 @@ def _save_state(state: dict):
 
 
 def reset_state():
-    """Полный сброс: очищаем все серии и позиции по всем монетам."""
+    """Полный сброс: очищаем все серии, позиции и счётчики воронки."""
     _save_state(_empty_state())
+    try:
+        reset_stats()
+    except Exception:
+        pass
     _events_buffer.clear()
     set_setting("liq_last_agg", "")
     set_setting("liq_last_events", "")
@@ -1020,6 +1078,10 @@ def get_status_text() -> str:
     lines.append(_candle_source_line())
     lines.append(f"⏳ Перепроверка свечи перед входом: за *{get_entry_confirm_sec()}с* до её закрытия")
     lines.append(_filters_status_line())
+    lines.append(_funnel_line())
+    _lf = _last_filters_line()
+    if _lf:
+        lines.append(_lf)
     lines.append(_ws_status_line())
     lines.append("")
 
@@ -1847,6 +1909,7 @@ async def _register_pending(context, cid, session, c, state, symbol, outcome,
     }
     _save_state(state)
 
+    _bump_stat("liq_stat_signals")
     left = int(win_end - now)
     log.info(
         f"liq: ⏸ {symbol} сигнал {agg['dominant']} свеча {candle} → {outcome}; "
@@ -2116,6 +2179,7 @@ async def _process_pending_impl(context):
             if state_now != signal_candle:
                 pending.pop(symbol, None)
                 _save_state(state)
+                _bump_stat("liq_stat_candle_cancel")
                 log.info(
                     f"liq: 🚫 {symbol} свеча перекрасилась {signal_candle} → "
                     f"{state_now} ({delta_pct:+.3f}%, {src}) — вход {outcome} отменён"
@@ -2145,7 +2209,27 @@ async def _process_pending_impl(context):
 
             passed, reasons, details = await check_entry_filters(
                 session, symbol, outcome, tf, win_start, min(now, win_end))
+
+            # Итог проверки сохраняем всегда — чтобы в статусе было видно,
+            # что фильтры реально считаются, даже когда они пропускают вход.
+            try:
+                set_setting(
+                    "liq_last_filters",
+                    f"[{symbol}] {_filters_detail_line(details)}"
+                    f" | {'отмена' if not passed else 'пропущено'}"
+                    f" | {_time_ago(time.time())}",
+                )
+            except Exception:
+                pass
+
             if not passed:
+                for r in reasons:
+                    if "свеч" in r:
+                        _bump_stat("liq_stat_filter_impulse")
+                    elif "OI" in r:
+                        _bump_stat("liq_stat_filter_oi")
+                    elif "поток" in r:
+                        _bump_stat("liq_stat_filter_cvd")
                 log.info(f"liq: 🛑 {symbol} фильтр безоткатного движения: "
                          f"{'; '.join(reasons)}")
                 set_setting(
@@ -2161,8 +2245,7 @@ async def _process_pending_impl(context):
                       "моменты и даёт серии убытков._",
                 )
                 continue
-            if details:
-                log.info(f"liq: фильтры пройдены {symbol}: {details}")
+            log.info(f"liq: фильтры пройдены {symbol}: {details or 'все выключены'}")
 
             log.info(
                 f"liq: ✅ {symbol} свеча подтвердилась ({state_now}, "
@@ -2373,6 +2456,7 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
     state["positions"][symbol] = pos
     (state.setdefault("pending", {})).pop(symbol, None)
     _save_state(state)
+    _bump_stat("liq_stat_entries")
 
     # Заранее готовим URL для сообщения и fallback
     poly_url = _polymarket_url(slug)
