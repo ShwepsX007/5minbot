@@ -500,6 +500,53 @@ def get_balance() -> Optional[float]:
         return None
 
 
+def get_book(token_id) -> Optional[dict]:
+    """Снимок стакана CLOB по токену: лучшие бид/аск и уровни.
+
+    Публичный эндпоинт (без L2-подписи). Возвращает:
+      {"best_bid": float, "best_ask": float,
+       "bids": [(price, size), ...], "asks": [(price, size), ...]}
+    или None, если стакан недоступен/пуст.
+    """
+    global _client
+    try:
+        client = _client
+        if client is None:
+            # Публичный клиент без ключей: эндпоинт книги не требует авторизации.
+            from py_clob_client_v2.client import ClobClient
+            from py_clob_client_v2.constants import POLYGON
+            client = ClobClient(host=HOST, chain_id=POLYGON)
+
+        book = client.get_order_book(str(token_id))
+        data = book if isinstance(book, dict) else _object_to_dict(book)
+        if not isinstance(data, dict):
+            return None
+
+        def _levels(key: str):
+            out = []
+            for lvl in (data.get(key) or []):
+                try:
+                    out.append((float(lvl.get("price")), float(lvl.get("size"))))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+            return out
+
+        bids = _levels("bids")
+        asks = _levels("asks")
+        if not bids or not asks:
+            return None
+
+        return {
+            "best_bid": max(p for p, _ in bids),
+            "best_ask": min(p for p, _ in asks),
+            "bids": bids,
+            "asks": asks,
+        }
+    except Exception as e:
+        log.warning(f"get_book error: {e}")
+        return None
+
+
 # =========================================================
 # ORDER PLACEMENT CORE
 # =========================================================
@@ -546,12 +593,24 @@ def _post_market_order_with_client(client, token_id, side: str, amount: float,
     return result
 
 
-def _extract_fill(res) -> Optional[dict]:
+def _extract_fill(res, side: str = "BUY") -> Optional[dict]:
     """Пытается достать фактический объём и цену исполнения из ответа CLOB.
 
     У рыночного ордера мы задаём сумму в долларах, а сколько долей за неё
     дали — знает только биржа. Если в ответе есть цифры, используем их,
     иначе вызывающий код останется на своей оценке.
+
+    ВАЖНО (semantics CLOB):
+      • sizeMatched — исполнено в ДОЛЯХ (для любой стороны);
+      • takingAmount — что мы ПОЛУЧИЛИ: для BUY это доли, для SELL это USDC;
+      • makingAmount — что мы ОТДАЛИ: для BUY это USDC (реальная стоимость!),
+        для SELL это доли.
+
+    Возвращает {shares, price, cost, status} (поля могут отсутствовать):
+      shares — исполненные доли;
+      cost   — для BUY реально потраченные USDC;
+      price  — цена исполнения, если биржа её сообщила (редко);
+      status — статус ордера (matched/live/...).
     """
     data = _object_to_dict(res)
     if not isinstance(data, dict):
@@ -568,12 +627,57 @@ def _extract_fill(res) -> Optional[dict]:
                 continue
         return None
 
-    shares = _num("sizeMatched", "size_matched", "takingAmount", "taking_amount",
-                  "matchedSize", "filledSize")
+    side = (side or "BUY").upper()
+    shares = _num("sizeMatched", "size_matched", "matchedSize", "filledSize")
+    if shares is None:
+        # sizeMatched нет — берём takingAmount, но для SELL это USDC, не доли.
+        taking = _num("takingAmount", "taking_amount")
+        if taking is not None and side == "BUY":
+            shares = taking
+
     price = _num("price", "avgPrice", "average_price")
-    if not shares:
+    making = _num("makingAmount", "making_amount")
+    taking = _num("takingAmount", "taking_amount")
+
+    # Для BUY makingAmount — потраченные USDC; для SELL takingAmount — полученные USDC.
+    cost = None
+    if side == "BUY":
+        cost = making if making is not None else taking
+    else:
+        cost = taking
+
+    if shares is None and price is None and cost is None:
         return None
-    return {"shares": shares, "price": price}
+    return {
+        "shares": shares,
+        "price": price,
+        "cost": cost,
+        "status": str(data.get("status") or "").strip().lower() or None,
+    }
+
+
+def is_order_accepted(res) -> tuple[bool, str]:
+    """Проверяет, действительно ли биржа ПРИНЯЛА ордер.
+
+    Раньше код смотрел только на ключ "error", который ставит наш
+    polymarket_trading. Но CLOB в ответе на POST /order использует ДРУГИЕ
+    ключи: {"success": false, "errorMsg": "not enough balance / allowance"}.
+    Такой ответ проходит проверку «not res.get("error")» — и отклонённый
+    ордер записывается в state как открытая позиция (фантомная сделка).
+    """
+    if not isinstance(res, dict):
+        return False, "пустой/некорректный ответ биржи"
+    if res.get("error"):
+        return False, str(res.get("error"))
+    if res.get("success") is False:
+        return False, str(res.get("errorMsg") or "success=false")
+    err_msg = str(res.get("errorMsg") or "").strip()
+    if err_msg:
+        return False, err_msg
+    status = str(res.get("status") or "").strip().lower()
+    if status in ("unmatched", "cancelled", "canceled", "expired", "rejected"):
+        return False, f"ордер не исполнен (статус: {status})"
+    return True, ""
 
 
 def _post_order_with_client(client, token_id, side: str, price: float, size: float):
