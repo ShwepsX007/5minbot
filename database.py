@@ -29,7 +29,7 @@ def init_db():
         );
     """)
     
-    for k, v in [("m_threshold","2.0"), ("m_interval","30"), ("market_notifications","1"), ("demo_mode", "0")]:
+    for k, v in [("m_threshold","2.0"), ("m_interval","30"), ("market_notifications","1"), ("demo_mode", "0"), ("stats_count", "10")]:
         c.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)",(k,v))
     c.commit(); c.close()
 

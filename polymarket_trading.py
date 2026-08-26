@@ -364,11 +364,22 @@ def get_market_info(token_id) -> Optional[dict]:
         data = r.json()
         if isinstance(data, list) and data:
             m = data[0]
+            # ВАЖНО: orderMinSize — это минимум в ДОЛЯХ (shares), а не в
+            # долларах. Обычно 5 shares: при цене 50¢ это $2.50, при 20¢ —
+            # $1.00. Раньше это значение трактовалось как «минимум $5», из-за
+            # чего расчёты размера ордера были неверными.
+            min_shares = float(m.get("orderMinSize", 5) or 5)
+            try:
+                tick = float(m.get("orderPriceMinTickSize", 0.01) or 0.01)
+            except (TypeError, ValueError):
+                tick = 0.01
             return {
                 "neg_risk": m.get("negRisk", False),
                 "accepting_orders": m.get("acceptingOrders", False),
                 "closed": m.get("closed", True),
-                "min_size": float(m.get("orderMinSize", 5)),
+                "min_size": min_shares,      # оставлено для совместимости
+                "min_shares": min_shares,
+                "tick_size": tick,
             }
         return None
     except Exception as e:
@@ -489,9 +500,185 @@ def get_balance() -> Optional[float]:
         return None
 
 
+def get_book(token_id) -> Optional[dict]:
+    """Снимок стакана CLOB по токену: лучшие бид/аск и уровни.
+
+    Публичный эндпоинт (без L2-подписи). Возвращает:
+      {"best_bid": float, "best_ask": float,
+       "bids": [(price, size), ...], "asks": [(price, size), ...]}
+    или None, если стакан недоступен/пуст.
+    """
+    global _client
+    try:
+        client = _client
+        if client is None:
+            # Публичный клиент без ключей: эндпоинт книги не требует авторизации.
+            from py_clob_client_v2.client import ClobClient
+            from py_clob_client_v2.constants import POLYGON
+            client = ClobClient(host=HOST, chain_id=POLYGON)
+
+        book = client.get_order_book(str(token_id))
+        data = book if isinstance(book, dict) else _object_to_dict(book)
+        if not isinstance(data, dict):
+            return None
+
+        def _levels(key: str):
+            out = []
+            for lvl in (data.get(key) or []):
+                try:
+                    out.append((float(lvl.get("price")), float(lvl.get("size"))))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+            return out
+
+        bids = _levels("bids")
+        asks = _levels("asks")
+        if not bids or not asks:
+            return None
+
+        return {
+            "best_bid": max(p for p, _ in bids),
+            "best_ask": min(p for p, _ in asks),
+            "bids": bids,
+            "asks": asks,
+        }
+    except Exception as e:
+        log.warning(f"get_book error: {e}")
+        return None
+
+
 # =========================================================
 # ORDER PLACEMENT CORE
 # =========================================================
+
+MIN_MARKET_ORDER_USD = 1.0     # FOK/FAK: минимум $1 (как на сайте)
+DEFAULT_MIN_LIMIT_SHARES = 5.0  # GTC/GTD: минимум 5 долей
+
+
+def _post_market_order_with_client(client, token_id, side: str, amount: float,
+                                   order_type: str = "FOK"):
+    """Настоящий рыночный ордер (FOK/FAK).
+
+    На Polymarket минимум в 5 долей действует только для ЛИМИТНЫХ ордеров
+    (GTC/GTD), которые ложатся в стакан. Маркетабельные FOK/FAK в стакане не
+    лежат, поэтому для них ограничение другое — минимум $1 по сумме. Именно
+    так работает кнопка Market на сайте, где можно купить на $1.
+
+    amount: для BUY — сумма в долларах, для SELL — количество долей.
+    """
+    from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
+
+    ot = OrderType.FOK if str(order_type).upper() == "FOK" else OrderType.FAK
+    order_args = MarketOrderArgsV2(
+        token_id=str(token_id),
+        amount=float(amount),
+        side=side,
+        order_type=ot,
+    )
+
+    try:
+        result = client.create_and_post_market_order(order_args, order_type=ot)
+        log.info(f"✅ Market order placed (create_and_post_market_order): {result}")
+        return result
+    except AttributeError:
+        pass
+    except Exception as e:
+        err1 = e
+        log.warning(f"create_and_post_market_order failed: {e}")
+
+    # Фолбэк: собрать и отправить двумя шагами
+    order = client.create_market_order(order_args)
+    result = client.post_order(order, ot)
+    log.info(f"✅ Market order placed (create_market_order + post_order): {result}")
+    return result
+
+
+def _extract_fill(res, side: str = "BUY") -> Optional[dict]:
+    """Пытается достать фактический объём и цену исполнения из ответа CLOB.
+
+    У рыночного ордера мы задаём сумму в долларах, а сколько долей за неё
+    дали — знает только биржа. Если в ответе есть цифры, используем их,
+    иначе вызывающий код останется на своей оценке.
+
+    ВАЖНО (semantics CLOB):
+      • sizeMatched — исполнено в ДОЛЯХ (для любой стороны);
+      • takingAmount — что мы ПОЛУЧИЛИ: для BUY это доли, для SELL это USDC;
+      • makingAmount — что мы ОТДАЛИ: для BUY это USDC (реальная стоимость!),
+        для SELL это доли.
+
+    Возвращает {shares, price, cost, status} (поля могут отсутствовать):
+      shares — исполненные доли;
+      cost   — для BUY реально потраченные USDC;
+      price  — цена исполнения, если биржа её сообщила (редко);
+      status — статус ордера (matched/live/...).
+    """
+    data = _object_to_dict(res)
+    if not isinstance(data, dict):
+        return None
+
+    def _num(*keys):
+        for k in keys:
+            v = data.get(k)
+            if v in (None, "", 0, "0"):
+                continue
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    side = (side or "BUY").upper()
+    shares = _num("sizeMatched", "size_matched", "matchedSize", "filledSize")
+    if shares is None:
+        # sizeMatched нет — берём takingAmount, но для SELL это USDC, не доли.
+        taking = _num("takingAmount", "taking_amount")
+        if taking is not None and side == "BUY":
+            shares = taking
+
+    price = _num("price", "avgPrice", "average_price")
+    making = _num("makingAmount", "making_amount")
+    taking = _num("takingAmount", "taking_amount")
+
+    # Для BUY makingAmount — потраченные USDC; для SELL takingAmount — полученные USDC.
+    cost = None
+    if side == "BUY":
+        cost = making if making is not None else taking
+    else:
+        cost = taking
+
+    if shares is None and price is None and cost is None:
+        return None
+    return {
+        "shares": shares,
+        "price": price,
+        "cost": cost,
+        "status": str(data.get("status") or "").strip().lower() or None,
+    }
+
+
+def is_order_accepted(res) -> tuple[bool, str]:
+    """Проверяет, действительно ли биржа ПРИНЯЛА ордер.
+
+    Раньше код смотрел только на ключ "error", который ставит наш
+    polymarket_trading. Но CLOB в ответе на POST /order использует ДРУГИЕ
+    ключи: {"success": false, "errorMsg": "not enough balance / allowance"}.
+    Такой ответ проходит проверку «not res.get("error")» — и отклонённый
+    ордер записывается в state как открытая позиция (фантомная сделка).
+    """
+    if not isinstance(res, dict):
+        return False, "пустой/некорректный ответ биржи"
+    if res.get("error"):
+        return False, str(res.get("error"))
+    if res.get("success") is False:
+        return False, str(res.get("errorMsg") or "success=false")
+    err_msg = str(res.get("errorMsg") or "").strip()
+    if err_msg:
+        return False, err_msg
+    status = str(res.get("status") or "").strip().lower()
+    if status in ("unmatched", "cancelled", "canceled", "expired", "rejected"):
+        return False, f"ордер не исполнен (статус: {status})"
+    return True, ""
+
 
 def _post_order_with_client(client, token_id, side: str, price: float, size: float):
     from py_clob_client_v2.clob_types import OrderArgsV2
@@ -535,7 +722,17 @@ def _post_order_with_client(client, token_id, side: str, price: float, size: flo
 # TRADING
 # =========================================================
 
-def place_order(token_id, side: str, price: float, size: float) -> dict:
+def place_order(token_id, side: str, price: float, size: float,
+                allow_min_bump: bool = True) -> dict:
+    """Отправка ордера.
+
+    allow_min_bump=True  — если размер меньше минимума рынка, поднять его
+                           до минимума (поведение ручной торговли из меню).
+    allow_min_bump=False — вернуть ошибку, не трогая размер. Так делает
+                           стратегия: молчаливое увеличение лота превращало
+                           ставку в $1 в реальную покупку на $2.50
+                           (5 shares × 50¢) и ломало мартингейл и учёт PnL.
+    """
     global _client
 
     try:
@@ -557,9 +754,26 @@ def place_order(token_id, side: str, price: float, size: float) -> dict:
         if market_info:
             if not market_info["accepting_orders"]:
                 return {"error": "Market is closed or resolved"}
-            if size < market_info["min_size"]:
-                size = market_info["min_size"]
-                log.info(f"Size adjusted to minimum: {size}")
+            min_shares = float(market_info.get("min_shares")
+                               or market_info.get("min_size") or 0)
+            if min_shares > 0 and size < min_shares:
+                if not allow_min_bump:
+                    log.warning(
+                        f"Order rejected locally: size {size} < min {min_shares} shares"
+                    )
+                    return {
+                        "error": (
+                            f"размер {size} долей меньше минимума рынка "
+                            f"{min_shares:g} (это ~${min_shares * price:.2f})"
+                        ),
+                        "code": "below_min_size",
+                        "min_shares": min_shares,
+                        "requested_size": size,
+                        "min_cost_usd": round(min_shares * price, 2),
+                    }
+                size = min_shares
+                log.info(f"Size adjusted to minimum: {size} shares "
+                         f"(~${size * price:.2f})")
 
         log.info(f"Placing order: {side} {size}@{price} | token={token_id}")
 
@@ -608,6 +822,86 @@ def place_order(token_id, side: str, price: float, size: float) -> dict:
 
     except Exception as e:
         log.error(f"place_order error: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        return {"error": str(e)}
+
+
+def place_market_order(token_id, side: str, amount: float,
+                       order_type: str = "FOK") -> dict:
+    """Рыночный ордер (FOK/FAK) — то же, что кнопка Market на сайте.
+
+    BUY : amount — сумма в долларах (минимум $1).
+    SELL: amount — количество долей (сумма тоже должна быть >= $1).
+
+    В отличие от лимитного place_order здесь НЕТ ограничения в 5 долей:
+    оно действует только для ордеров, которые ложатся в стакан (GTC/GTD).
+    """
+    global _client
+
+    try:
+        if _client is None:
+            return {"error": "Trading client not initialized"}
+
+        side = "BUY" if side.upper() == "BUY" else "SELL"
+        amount = float(amount)
+        if not math.isfinite(amount) or amount <= 0:
+            return {"error": "Amount must be a positive finite number"}
+
+        market_info = get_market_info(token_id)
+        if market_info and not market_info["accepting_orders"]:
+            return {"error": "Market is closed or resolved"}
+
+        if side == "BUY" and amount < MIN_MARKET_ORDER_USD:
+            return {
+                "error": (f"сумма ${amount:.2f} меньше минимума рыночного "
+                          f"ордера ${MIN_MARKET_ORDER_USD:.2f}"),
+                "code": "below_min_notional",
+                "min_notional_usd": MIN_MARKET_ORDER_USD,
+            }
+
+        log.info(f"Placing MARKET order: {side} amount={amount} "
+                 f"({'USD' if side == 'BUY' else 'shares'}) "
+                 f"type={order_type} | token={token_id}")
+
+        try:
+            _update_balance_allowance_safe(_client)
+        except Exception as e:
+            log.warning(f"⚠️ Could not update allowance: {e}")
+
+        current_sig = _get_int_env("POLY_SIGNATURE_TYPE", 1)
+        sig_candidates = []
+        for st in [current_sig, 1, 2, 3, 0]:
+            if st not in sig_candidates:
+                sig_candidates.append(st)
+
+        last_error = None
+        for st in sig_candidates:
+            try:
+                log.info(f"🔄 Market order через sig_type={st}...")
+                client = _build_client(st)
+                try:
+                    _update_balance_allowance_safe(client)
+                except Exception as e:
+                    log.warning(f"allowance update sig_type={st} failed: {e}")
+
+                result = _post_market_order_with_client(
+                    client, token_id, side, amount, order_type)
+
+                _client = client
+                update_env_and_config({"POLY_SIGNATURE_TYPE": str(st)})
+                log.info(f"✅ Рабочий sig_type для market-ордера: {st}")
+                return result
+            except Exception as e:
+                last_error = e
+                log.warning(f"sig_type={st} market order failed: "
+                            f"{_extract_error_text(e)}")
+                continue
+
+        return {"error": str(last_error)}
+
+    except Exception as e:
+        log.error(f"place_market_order error: {e}")
         import traceback
         log.error(traceback.format_exc())
         return {"error": str(e)}

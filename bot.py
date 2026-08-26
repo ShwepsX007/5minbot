@@ -10,12 +10,55 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from database import *
-from utils import fetch_market, build_trend, threshold_exceeded, generate_plot
+from utils import fetch_market, build_trend, threshold_exceeded, generate_plot, generate_pnl_plot, calc_pnl_curve
 import liq_strategy as ls
 import liq_menu
 from config import BASE_DIR, ADMIN_CHAT_IDS
 
 log = logging.getLogger("bot")
+
+
+async def md_edit(q, text, **kwargs):
+    """edit_message_text с откатом на обычный текст.
+
+    Если в статус попала битая Markdown-разметка (например, `BTC_USDT`
+    вне обратных кавычек), Telegram отвечает «Can't parse entities», и
+    раньше исключение уходило наверх — кнопки стратегии переставали
+    отвечать. Теперь сообщение просто уходит без форматирования.
+    """
+    kwargs.setdefault("parse_mode", "Markdown")
+    try:
+        return await q.edit_message_text(text, **kwargs)
+    except BadRequest as e:
+        low = str(e).lower()
+        if "not modified" in low:
+            return None
+        if "parse entities" not in low:
+            raise
+        log.warning(f"Markdown битый, показываю без разметки: {e}")
+        kwargs.pop("parse_mode", None)
+        try:
+            return await q.edit_message_text(text, **kwargs)
+        except BadRequest as e2:
+            log.warning(f"plain edit err: {e2}")
+            return None
+
+
+async def md_reply(message, text, **kwargs):
+    """reply_text с тем же откатом на обычный текст."""
+    kwargs.setdefault("parse_mode", "Markdown")
+    try:
+        return await message.reply_text(text, **kwargs)
+    except BadRequest as e:
+        if "parse entities" not in str(e).lower():
+            raise
+        log.warning(f"Markdown битый, показываю без разметки: {e}")
+        kwargs.pop("parse_mode", None)
+        try:
+            return await message.reply_text(text, **kwargs)
+        except BadRequest as e2:
+            log.warning(f"plain reply err: {e2}")
+            return None
 user_state = {}
 
 
@@ -86,6 +129,7 @@ def api_settings_kb():
 def settings_kb():
     mth = get_setting("m_threshold", "2.0")
     mi = get_setting("m_interval", "30")
+    sc = get_setting("stats_count", "10")
 
     def m(v, c): return f"»{v}«" if str(v) == str(c) else str(v)
 
@@ -94,6 +138,8 @@ def settings_kb():
         [Btn(m(f"{v}с", f"{mi}с"), callback_data=f"smi_{v}") for v in (5, 10, 20, 30, 60)],
         [Btn("— Порог уведомлений рынков —", callback_data="noop")],
         [Btn(m(f"{v}%", f"{int(float(mth))}%"), callback_data=f"smt_{v}") for v in (1, 2, 5, 10)],
+        [Btn("— Сделок в статистике —", callback_data="noop")],
+        [Btn(m(f"{v}", sc), callback_data=f"ssc_{v}") for v in (10, 20, 50, 100)],
         back("back_main"),
     ])
 
@@ -146,9 +192,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt = ls.get_status_text()
             if len(txt) > 3800:
                 txt = txt[:3800] + "\n\n_...обрезано_"
-            return await update.message.reply_text(
-                "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt,
-                parse_mode="Markdown", reply_markup=liq_menu.strat_menu_kb()
+            return await md_reply(
+                update.message, "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt,
+                reply_markup=liq_menu.strat_menu_kb()
             )
 
         if text == "⚙️ Настройки":
@@ -341,7 +387,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Telegram limit 4096, keep safe margin for markup
             if len(txt) > 3800:
                 txt = txt[:3800] + "\n\n_...обрезано, полный статус в логах_"
-            return await q.edit_message_text("🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt, parse_mode="Markdown", reply_markup=liq_menu.strat_menu_kb())
+            return await md_edit(q, "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt, reply_markup=liq_menu.strat_menu_kb())
 
         if d == "liq_toggle":
             s["state"] = None
@@ -351,7 +397,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt = ls.get_status_text()
             if len(txt) > 3800:
                 txt = txt[:3800] + "\n\n_...обрезано_"
-            return await q.edit_message_text("🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt, parse_mode="Markdown", reply_markup=liq_menu.strat_menu_kb())
+            return await md_edit(q, "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt, reply_markup=liq_menu.strat_menu_kb())
 
         if d == "liq_status":
             s["state"] = None
@@ -361,9 +407,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 txt = txt[:3800] + "\n\n_...обрезано_"
             # Reply instead of editing the unchanged menu: Telegram rejects an
             # identical edit with HTTP 400, which made Status appear unresponsive.
-            return await q.message.reply_text(
-                "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt,
-                parse_mode="Markdown", reply_markup=liq_menu.strat_menu_kb()
+            return await md_reply(
+                q.message, "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt,
+                reply_markup=liq_menu.strat_menu_kb()
             )
 
         if d == "liq_reset":
@@ -373,7 +419,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt = ls.get_status_text()
             if len(txt) > 3800:
                 txt = txt[:3800] + "\n\n_...обрезано_"
-            return await q.edit_message_text("✅ Серия сброшена.\n\n" + txt, parse_mode="Markdown", reply_markup=liq_menu.strat_menu_kb())
+            return await md_edit(q, "✅ Серия сброшена.\n\n" + txt, reply_markup=liq_menu.strat_menu_kb())
 
         if d == "liq_settings":
             s["state"] = None
@@ -400,9 +446,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Обновим подписку Bybit WS, чтобы новые монеты начали литься
             try:
                 import liq_api as _la
-                _la.set_bybit_symbols(ls.get_selected_symbols())
+                _la.set_symbols(ls.get_selected_symbols())
+                import orderflow as _ofl
+                _ofl.set_symbols(ls.get_selected_symbols())
             except Exception as e:
-                log.debug(f"set_bybit_symbols err: {e}")
+                log.debug(f"set_symbols err: {e}")
             return await q.edit_message_text(
                 liq_menu.pairs_view_text(),
                 parse_mode="Markdown",
@@ -413,9 +461,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ls.set_selected_symbols(list(ls.AVAILABLE_SYMBOLS))
             try:
                 import liq_api as _la
-                _la.set_bybit_symbols(ls.get_selected_symbols())
+                _la.set_symbols(ls.get_selected_symbols())
+                import orderflow as _ofl
+                _ofl.set_symbols(ls.get_selected_symbols())
             except Exception as e:
-                log.debug(f"set_bybit_symbols err: {e}")
+                log.debug(f"set_symbols err: {e}")
             return await q.edit_message_text(
                 liq_menu.pairs_view_text(),
                 parse_mode="Markdown",
@@ -656,16 +706,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             trades = get_trade_statistics(1 if demo else 0)
             if not trades:
                 return await q.edit_message_text(f"📊 Статистика пуста ({'ДЕМО' if demo else 'РЕАЛ'}).", reply_markup=KB([back("tr_back")]))
+            count = int(get_setting("stats_count", "10"))
             total_pnl = round(sum(t["pnl"] for t in trades), 2)
             wins = sum(1 for t in trades if t["pnl"] > 0)
             msg = (f"📊 *Статистика ({'🎮 ДЕМО' if demo else '💰 РЕАЛ'})*\n\n"
                    f"Всего сделок: *{len(trades)}*\nВ плюс: *{wins}* | В минус: *{len(trades) - wins}*\n"
-                   f"Суммарный PnL: *{'+' if total_pnl >= 0 else ''}{total_pnl}$*\n\n*Последние сделки:*\n")
-            for t in trades[:10]:
+                   f"Суммарный PnL: *{'+' if total_pnl >= 0 else ''}{total_pnl}$*\n\n"
+                   f"*Последние сделки (до {count}):*\n")
+            for t in trades[:count]:
                 msg += f"{'🟢' if t['pnl'] >= 0 else '🔴'} {t['question'][:30]} | {t['side']} {t['outcome']} | {'+' if t['pnl']>=0 else ''}{t['pnl']}$\n"
             return await q.edit_message_text(msg[:4000], parse_mode="Markdown", reply_markup=KB([
+                [Btn("📈 График PnL", callback_data="tr_stats_chart")],
                 [Btn("🗑 Очистить статистику", callback_data="tr_stats_clear")], back("tr_back")
             ]))
+
+        if d == "tr_stats_chart":
+            demo = get_setting("demo_mode", "0") == "1"
+            trades = get_trade_statistics(1 if demo else 0)
+            if not trades:
+                return await q.answer("Статистика пуста, графику не из чего строиться.", show_alert=True)
+            buf = generate_pnl_plot(trades, is_demo=demo)
+            if not buf:
+                return await q.answer("Недостаточно данных для графика.", show_alert=True)
+            curve = calc_pnl_curve(trades)
+            caption = (f"📈 PnL — {'🎮 ДЕМО' if demo else '💰 РЕАЛ'}\n"
+                       f"Сделок: {curve['count']} | В плюс: {curve['wins']} | В минус: {curve['losses']}\n"
+                       f"Итого: {'+' if curve['total_pnl'] >= 0 else ''}{curve['total_pnl']}$ | "
+                       f"Макс. просадка: {round(curve['max_drawdown'], 2)}$")
+            await q.message.reply_photo(photo=buf, caption=caption)
+            return
 
         if d == "tr_stats_clear":
             clear_trade_statistics(1 if get_setting("demo_mode", "0") == "1" else 0)
@@ -747,6 +816,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if d.startswith("smt_"):
             set_setting("m_threshold", d[4:])
+            return await q.edit_message_text("✅", reply_markup=settings_kb())
+
+        if d.startswith("ssc_"):
+            set_setting("stats_count", d[4:])
             return await q.edit_message_text("✅", reply_markup=settings_kb())
 
     except BadRequest as e:
@@ -835,6 +908,28 @@ async def job_liq_position(context: ContextTypes.DEFAULT_TYPE):
         log.exception(f"job_liq_position error: {e}")
 
 
+# Фоновые задачи ГЛОБАЛЬНЫЕ: стратегия одна на весь бот (состояние лежит в
+# БД), поэтому и сканеров должно быть по одному. Раньше имена содержали
+# chat_id, и при нескольких админах (или /start в личке и в группе) на одну
+# стратегию работало несколько копий джобов — отсюда дубли сообщений,
+# двойные входы и «серия закрыта» одновременно с «шаг проигран».
+STRATEGY_JOB_NAMES = ("mk_job", "liq_signal_job", "liq_position_job")
+
+
+def _remove_strategy_jobs(jq):
+    """Снимает все экземпляры фоновых задач, включая старые имена с chat_id."""
+    for name in STRATEGY_JOB_NAMES:
+        for j in jq.get_jobs_by_name(name):
+            j.schedule_removal()
+    try:
+        for j in jq.jobs():
+            nm = j.name or ""
+            if any(nm.startswith(p + ":") for p in STRATEGY_JOB_NAMES):
+                j.schedule_removal()
+    except Exception as e:
+        log.debug(f"job cleanup err: {e}")
+
+
 def schedule_jobs(context, cid=None):
     jq = getattr(context, "job_queue", None) or getattr(context, "application", None) and context.application.job_queue
     if not jq:
@@ -842,10 +937,10 @@ def schedule_jobs(context, cid=None):
 
     if not cid:
         return
-    names = [f"{prefix}:{cid}" for prefix in ("mk_job", "liq_signal_job", "liq_position_job")]
-    for name in names:
-        for j in jq.get_jobs_by_name(name):
-            j.schedule_removal()
+
+    _remove_strategy_jobs(jq)
+    names = list(STRATEGY_JOB_NAMES)
+    log.info(f"Фоновые задачи перевешены на чат {cid}")
 
     mi = int(get_setting("m_interval", "30"))
     jq.run_repeating(job_markets, interval=mi, first=15, name=names[0], data={"cid": cid})
