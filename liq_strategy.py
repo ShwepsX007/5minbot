@@ -24,6 +24,11 @@
 как «новый» сигнал и вошёл со второй попытки.
 
 ВЫХОД:
+  0. Тейк по ПЕРВОЙ ставке (liq_tp_first_cents / liq_tp_first_sec):
+     первые N секунд окна бот пытается закрыть первый шаг серии
+     FAK-ордером, если цена нашего исхода дошла до уровня — откат после
+     каскада часто идёт в первые секунды, потом цену может переметнуть.
+     Закрыл → цикл завершён. Не успел за N секунд → обычный режим.
   1. Достигнут liq_tp_cents → продаём (лимиткой на TP, а если позиция
      меньше $5 — по рынку).
   2. За liq_new_order_time секунд до конца окна смотрим свечу ТЕКУЩЕГО
@@ -203,6 +208,15 @@ DEFAULTS = {
     # не дошла до TP, за liq_new_order_time до конца окна бот закрывает по рынку
     # (текущая страховка). По умолчанию 90 — фиксируем почти всю прибыль.
     "liq_tp_cents":      "90",
+    # Тейк по ПЕРВОЙ ставке серии: первые liq_tp_first_sec секунд окна бот
+    # пытается закрыть позицию FAK-ордером, как только цена нашего исхода
+    # доходит до liq_tp_first_cents (и выше входа). Идея: откат после
+    # каскада ликвидаций часто происходит в первые секунды окна, а потом
+    # цену может переметнуть — лучше забрать текущий коэффициент, чем
+    # держать до расчёта. Успех → цикл завершён. Не успел — обычный режим.
+    # Действует только для первого шага серии (series == 0). 0 — выключено.
+    "liq_tp_first_cents": "75",
+    "liq_tp_first_sec":   "30",
     # Сколько последних сделок показывать в блоке «Последние сделки» статуса.
     "liq_recent_count":  "20",
     # Тип входа: "market" (по текущей лучшей цене) или "limit" (по entry_price_cents).
@@ -1464,7 +1478,7 @@ def get_status_text() -> str:
                   else f"x{c['liq_martingale_mult']}^шаг")
     lines.append(f"💵 Лот: *{c['liq_base_stake']}$* | ♻️ Мартин: *{_mg_scheme}* | 🎯 Лимит-цена: *{c['liq_entry_price_cents']}¢* (кэп {c.get('liq_max_entry_cents', DEFAULTS['liq_max_entry_cents'])}¢) | 🧮 Макс.серия: *{c['liq_max_series']}*")
     lines.append(f"🚧 {min_lot_txt} | если лот меньше: *{min_mode_txt}*")
-    lines.append(f"🏁 TP: *{c['liq_tp_cents']}¢* | ⏰ Страховка: *{c['liq_new_order_time']}с* до конца окна | 🕘 В списке: *{c['liq_recent_count']}* сделок")
+    lines.append(f"🏁 TP: *{c['liq_tp_cents']}¢* | 🎯 1-й тейк: *{c.get('liq_tp_first_cents', DEFAULTS['liq_tp_first_cents'])}¢/{c.get('liq_tp_first_sec', DEFAULTS['liq_tp_first_sec'])}с* (0 — выкл) | ⏰ Страховка: *{c['liq_new_order_time']}с* до конца окна | 🕘 В списке: *{c['liq_recent_count']}* сделок")
     lines.append(f"🔁 Чек: {c['liq_check_interval']}с | 👁 Скан: {c['liq_scan_interval']}с")
     lines.append(_candle_source_line())
     _sb = ("🕯 свеча ликвидаций (текущее окно)" if get_signal_candle_basis() == "current"
@@ -3608,6 +3622,159 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
                 pass
 
 
+def get_tp_first_config(c: dict) -> tuple[int, int]:
+    """Тейк по первой ставке: (уровень в центах, первые секунд окна).
+
+    0 в любой из величин выключает механику. Действует только для
+    первого шага серии (series == 0).
+    """
+    try:
+        tp = int(float(c.get("liq_tp_first_cents",
+                             DEFAULTS["liq_tp_first_cents"])))
+    except (TypeError, ValueError):
+        tp = 75
+    tp = max(0, min(99, tp))
+    try:
+        sec = int(float(c.get("liq_tp_first_sec",
+                              DEFAULTS["liq_tp_first_sec"])))
+    except (TypeError, ValueError):
+        sec = 30
+    sec = max(0, min(240, sec))
+    return tp, sec
+
+
+def first_take_applicable(c: dict, pos: dict, now: float) -> bool:
+    """Пробовать ли FAK-тейк на этом тике (только первая ставка серии)."""
+    tp, sec = get_tp_first_config(c)
+    if tp <= 0 or sec <= 0:
+        return False
+    if int(pos.get("series", 0) or 0) != 0:
+        return False
+    if pos.get("awaiting_resolution"):
+        return False
+    win_end = pos.get("window_end") or 0
+    if not win_end:
+        return False
+    win_start = pos.get("window_start") or (win_end - 300)
+    elapsed = now - win_start
+    return 0 <= elapsed < sec and now < win_end
+
+
+async def _try_first_take(context, cid, c, state, symbol, pos) -> bool:
+    """FAK-тейк отката по ПЕРВОЙ ставке серии.
+
+    Вызывается в первые секунды окна: если цена нашего исхода дошла до
+    liq_tp_first_cents (и выше цены входа) — продаём доли FAK-ордером,
+    «забираем какой есть коэффициент»: откат после каскада ликвидаций
+    часто сменяется перемётом в другую сторону.
+
+    Возвращает True, если позиция закрыта (цикл завершён).
+    """
+    import polymarket_trading as pt
+
+    tp, sec = get_tp_first_config(c)
+    if tp <= 0 or sec <= 0:
+        return False
+
+    now = time.time()
+    is_demo_flag = pos.get("is_demo", 0)
+    shares = float(pos.get("shares", pos.get("stake") or 0) or 0)
+    entry_cents = int(pos.get("entry_cents") or 0)
+    if shares <= 0:
+        return False
+
+    info = pt.get_event_markets(pos["slug"])
+    if not info or not info.get("markets"):
+        return False
+    m = info["markets"][0]
+    market_question = m.get("question", pos["slug"])
+    price_yes = m.get("price_yes") or 0
+    price_no = m.get("price_no") or 0
+    try:
+        our_price = int(round(float(
+            price_yes if pos["outcome"] == "UP" else price_no)))
+    except (TypeError, ValueError):
+        return False
+    if our_price < tp or our_price <= entry_cents:
+        return False
+
+    reason = f"FAK-тейк в первые {sec}с окна (уровень {tp}¢)"
+
+    if is_demo_flag:
+        # В демо имитируем исполнение FAK по текущей цене рынка.
+        log.info(f"liq: 🎯 {symbol} первый тейк {tp}¢: цена {our_price}¢ — "
+                 f"ДЕМО, закрываю")
+        await _settle_position(context, cid, c, state, symbol, pos, win=True,
+                               close_price=our_price, price_yes=price_yes,
+                               price_no=price_no,
+                               market_question=market_question,
+                               early_exit=True, settle_ts=now, reason=reason)
+        return True
+
+    # РЕАЛ: продаём ВСЕ доли FAK-ордером (что исполнится — то забираем,
+    # остаток убивается).
+    try:
+        res = pt.place_market_order(pos["token_id"], "SELL", shares,
+                                    order_type="FAK")
+    except Exception as e:
+        log.warning(f"liq: {symbol} FAK-тейк исключение: {e}")
+        return False
+
+    ok, why = pt.is_order_accepted(res)
+    try:
+        fill = pt._extract_fill(res, "SELL") or {}
+    except Exception:
+        fill = {}
+    filled = float(fill.get("shares") or 0)
+    if not ok or filled <= 0:
+        log.info(f"liq: {symbol} FAK-тейк не исполнился (цена ушла): {why}")
+        return False
+
+    # Средняя цена исполнения: для SELL биржа сообщает полученные USDC
+    # (takingAmount → fill["cost"]) и исполненные доли.
+    got_usd = float(fill.get("cost") or 0)
+    if got_usd > 0:
+        avg_cents = got_usd / filled * 100.0
+    elif fill.get("price"):
+        avg_cents = float(fill["price"]) * 100.0
+    else:
+        avg_cents = float(our_price)
+    avg_cents_i = max(1, min(100, int(round(avg_cents))))
+
+    leftover = shares - filled
+    if leftover > 0 and leftover * avg_cents_i / 100.0 >= POLY_MIN_NOTIONAL_USD:
+        # FAK исполнился ЧАСТИЧНО и остаток значим: фиксируем частичный
+        # тейк и продолжаем обычную работу уменьшенной позицией.
+        pos["shares"] = round(leftover, 4)
+        pos["first_take_partial"] = round(filled, 4)
+        state.setdefault("positions", {})[symbol] = pos
+        _save_state(state)
+        log.info(f"liq: {symbol} FAK-тейк частичный: {filled:g} из {shares:g} "
+                 f"долей @ ~{avg_cents_i}¢, остаток {leftover:g} дальше")
+        try:
+            await _send(
+                context, cid,
+                f"🎯 *Первый тейк — частичный* `{symbol}` "
+                f"{'🎮 ДЕМО' if is_demo_flag else '💰 РЕАЛ'}\n"
+                f"FAK исполнил *{filled:g}* из {shares:g} долей @ ~{avg_cents_i}¢ "
+                f"(вход {entry_cents}¢)\n"
+                f"Остаток *{leftover:g}* долей продолжает в обычном режиме",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return False
+
+    log.info(f"liq: 🎯 {symbol} первый тейк: FAK исполнен "
+             f"{filled:g} долей @ ~{avg_cents_i}¢ (уровень {tp}¢)")
+    await _settle_position(context, cid, c, state, symbol, pos, win=True,
+                           close_price=avg_cents_i, price_yes=price_yes,
+                           price_no=price_no,
+                           market_question=market_question,
+                           early_exit=True, settle_ts=now, reason=reason)
+    return True
+
+
 async def _check_open_position(context, cid, session, c, state, symbol, pos):
     """Ведение одной открытой позиции.
 
@@ -3656,6 +3823,16 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
     if time_left <= 0:
         await _resolve_after_window(context, cid, session, c, state, symbol, pos)
         return
+
+    # === ПЕРВАЯ ставка: FAK-тейк отката в первые секунды окна ===
+    # Откат после каскада ликвидаций часто приходит в самом начале окна,
+    # а потом цену может переметнуть. Поэтому первый шаг серии в первые
+    # liq_tp_first_sec секунд пытаемся закрыть по уровню
+    # liq_tp_first_cents FAK-ордером («забрать какой есть коэффициент»).
+    # Не успели — дальше обычный режим ниже по коду.
+    if first_take_applicable(c, pos, now):
+        if await _try_first_take(context, cid, c, state, symbol, pos):
+            return
 
     try:
         tp_cents = int(float(c.get("liq_tp_cents", "90")))

@@ -14,6 +14,8 @@
   5. Пауза сигналов после отмены входа фильтром (раздел 8).
   6. Свеча окна — из того же 60-секундного TWAP-потока, по которому
      Polymarket рассчитывает рынки 5m/15m/1h (раздел 9).
+  7. FAK-тейк отката по первой ставке: гейт по шагу/времени окна и
+     демо-исполнение (раздел 10).
 """
 import asyncio
 import os
@@ -503,6 +505,95 @@ async def main():
     check("дефолт ожидания расчёта рынка — 300с",
           ls.DEFAULTS["liq_market_confirm_wait"] == "300",
           ls.DEFAULTS["liq_market_confirm_wait"])
+
+    print("\n=== 10. FAK-тейк отката по первой ставке ===")
+    c_full = dict(ls.DEFAULTS)
+    tp, sec = ls.get_tp_first_config(c_full)
+    check("дефолт: 75¢ / 30с", tp == 75 and sec == 30, f"{tp}/{sec}")
+    tp, sec = ls.get_tp_first_config({**c_full, "liq_tp_first_cents": "80",
+                                      "liq_tp_first_sec": "45"})
+    check("переопределение настройками", tp == 80 and sec == 45)
+    tp, sec = ls.get_tp_first_config({**c_full, "liq_tp_first_cents": "abc",
+                                      "liq_tp_first_sec": "xyz"})
+    check("мусор в настройках → дефолт", tp == 75 and sec == 30)
+
+    now_t = time.time()
+    pos1 = {"series": 0, "window_start": now_t - 5, "window_end": now_t + 295,
+            "outcome": "UP", "entry_cents": 51, "shares": 10.0, "is_demo": 1,
+            "slug": "eth-updown-5m-test"}
+    check("первый шаг, 5-я секунда окна → включён",
+          ls.first_take_applicable(c_full, pos1, now_t) is True)
+    check("шаг мартингейла (series=1) → выключен",
+          ls.first_take_applicable(c_full, {**pos1, "series": 1}, now_t) is False)
+    check("N секунд окна прошли → выключен",
+          ls.first_take_applicable(c_full,
+                                   {**pos1, "window_start": now_t - 31},
+                                   now_t) is False)
+    check("окно ещё не началось → выключен",
+          ls.first_take_applicable(c_full,
+                                   {**pos1, "window_start": now_t + 10},
+                                   now_t) is False)
+    check("уровень 0 → выключен",
+          ls.first_take_applicable({**c_full, "liq_tp_first_cents": "0"},
+                                   pos1, now_t) is False)
+    check("окно 0с → выключен",
+          ls.first_take_applicable({**c_full, "liq_tp_first_sec": "0"},
+                                   pos1, now_t) is False)
+    check("awaiting_resolution → выключен",
+          ls.first_take_applicable(c_full,
+                                   {**pos1, "awaiting_resolution": 1},
+                                   now_t) is False)
+
+    # Демо-исполнение: цена выше уровня и выше входа → закрываем в плюс.
+    pt_stub = sys.modules["polymarket_trading"]
+    real_get_em = getattr(pt_stub, "get_event_markets", None)
+    pt_stub.get_event_markets = lambda slug: {"markets": [{
+        "question": "Test ETH", "price_yes": 78, "price_no": 22}]}
+    settle_calls = []
+    real_settle = ls._settle_position
+
+    async def fake_settle(context, cid, c, state, symbol, pos, **kw):
+        settle_calls.append({"symbol": symbol, **kw})
+
+    ls._settle_position = fake_settle
+    try:
+        r = await ls._try_first_take(None, 1, c_full, {}, sym, dict(pos1))
+        check("ДЕМО: 78¢ >= 75¢ → закрыли в плюс",
+              r is True and len(settle_calls) == 1
+              and settle_calls[0]["win"] is True
+              and settle_calls[0]["close_price"] == 78)
+        check("reason закрытия упоминает FAK-тейк",
+              "FAK" in str(settle_calls[0].get("reason", "")))
+
+        pt_stub.get_event_markets = lambda slug: {"markets": [{
+            "question": "Test ETH", "price_yes": 60, "price_no": 40}]}
+        r = await ls._try_first_take(None, 1, c_full, {}, sym, dict(pos1))
+        check("ДЕМО: 60¢ < 75¢ → не закрываем",
+              r is False and len(settle_calls) == 1)
+
+        pt_stub.get_event_markets = lambda slug: {"markets": [{
+            "question": "Test ETH", "price_yes": 78, "price_no": 22}]}
+        r = await ls._try_first_take(None, 1, c_full, {}, sym,
+                                     {**pos1, "entry_cents": 80})
+        check("выше уровня, но ниже входа → не закрываем",
+              r is False and len(settle_calls) == 1)
+    finally:
+        ls._settle_position = real_settle
+        if real_get_em is not None:
+            pt_stub.get_event_markets = real_get_em
+        else:
+            try:
+                delattr(pt_stub, "get_event_markets")
+            except AttributeError:
+                pass
+
+    keys = [k for k, _, _ in liq_menu.PARAMS]
+    check("liq_tp_first_cents есть в меню", "liq_tp_first_cents" in keys)
+    check("liq_tp_first_sec есть в меню", "liq_tp_first_sec" in keys)
+    ok, norm, err = liq_menu.validate_manual_input("liq_tp_first_cents", "75")
+    check("ручной ввод уровня 75¢", ok and norm == "75", err)
+    ok, norm, err = liq_menu.validate_manual_input("liq_tp_first_sec", "999")
+    check("окно 999с > максимума 240 → ошибка", not ok)
 
     print(f"\nИТОГ: {PASS} прошло, {FAIL} упало")
     return FAIL
