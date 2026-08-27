@@ -180,8 +180,9 @@ GATE_BASE = liq_api.GATE_BASE
 # Версия логики ликвидаций. Показывается в статус-экране, чтобы из
 # Telegram было видно, перезапущен ли бот с новым кодом. Обновлять при
 # каждом значимом изменении логики.
-STRATEGY_VERSION = ("27.08.2026 #3 — свеча из 60с TWAP (как рынок), "
-                    "ожидание расчёта 300с, FAK-тейк 1-й ставки")
+STRATEGY_VERSION = ("27.08.2026 #4 — вердикт только после официального "
+                    "разрешения рынка, цены выходов из живого стакана, "
+                    "свеча из 60с TWAP, FAK-тейк 1-й ставки")
 
 # ===================== ПАРАМЕТРЫ ПО УМОЛЧАНИЮ =====================
 DEFAULTS = {
@@ -3702,6 +3703,19 @@ async def _try_first_take(context, cid, c, state, symbol, pos) -> bool:
             price_yes if pos["outcome"] == "UP" else price_no)))
     except (TypeError, ValueError):
         return False
+
+    # Живой бид из стакана: гамма отстаёт, и демо фиксировало бы тейк по
+    # устаревшей цене (тот же класс фантомов, что кейс XRP 21:10).
+    try:
+        live = pt.get_live_price(pos["token_id"])
+        if live and live.get("bid") is not None:
+            if int(live["bid"]) != our_price:
+                log.info(f"liq: {symbol} первый тейк: живой бид "
+                         f"{int(live['bid'])}¢ (гамма {our_price}¢)")
+            our_price = int(live["bid"])
+    except Exception:
+        pass
+
     if our_price < tp or our_price <= entry_cents:
         return False
 
@@ -3883,6 +3897,25 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
     entry_cents = pos["entry_cents"]
     is_demo_flag = pos.get("is_demo", 0)
     shares = pos.get("shares", pos["stake"])
+
+    # Живая цена из стакана CLOB (best bid — сколько реально дадут за наши
+    # доли при немедленной продаже). Гамма заметно отстаёт от рынка: в
+    # последние секунды окна она может показывать 50-60¢ там, где стакан
+    # уже 10-20¢ (кейс XRP 21:10 27.08.2026 — фантомное «спасение в плюс»
+    # по 52¢, когда реально рынок уже был против нас). Все решения о
+    # выходе (тейк, аварийный выход) принимаем по живому биду; если стакан
+    # недоступен — остаёмся на цене гаммы.
+    live = None
+    try:
+        live = pt.get_live_price(pos["token_id"])
+    except Exception as e:
+        log.debug(f"liq: {symbol} live price error: {e}")
+    if live and live.get("bid") is not None and int(live["bid"]) != int(close_price):
+        log.info(f"liq: {symbol} живой бид {int(live['bid'])}¢ "
+                 f"(гамма показывала {int(close_price)}¢)")
+    if live and live.get("bid") is not None:
+        close_price = int(live["bid"])
+
     tp_hit = close_price >= tp_cents
     in_profit = close_price > entry_cents
     emergency_time = time_left <= new_order_time
@@ -4034,11 +4067,13 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
                     f"ордера, продать нельзя"
                 )
 
+        src_note = "живой стакан" if (live and live.get("bid") is not None) else "гамма"
         await _settle_position(context, cid, c, state, symbol, pos, win=False,
                                close_price=salvage_price, price_yes=price_yes,
                                price_no=price_no, market_question=market_question,
                                early_exit=True, settle_ts=now,
-                               reason=f"свеча окна {state_txt} против {pos['outcome']}")
+                               reason=(f"свеча окна {state_txt} против {pos['outcome']} "
+                                       f"(цена {int(salvage_price)}¢ — {src_note})"))
         return
 
     # Не наш сценарий — цена между входом и TP, времени ещё достаточно.
@@ -4071,6 +4106,7 @@ async def _resolve_after_window(context, cid, session, c, state, symbol, pos):
     #    расходятся, и 23.08.2026 это дало фантомный «плюс» по шагу,
     #    который реально рассчитался против нас.
     price_yes = price_no = 0
+    market_resolved = False
     market_question = pos.get("market_question_raw") or pos["slug"]
     try:
         info = pt.get_event_markets(pos["slug"])
@@ -4079,12 +4115,28 @@ async def _resolve_after_window(context, cid, session, c, state, symbol, pos):
             market_question = m.get("question", market_question)
             price_yes = m.get("price_yes") or 0
             price_no = m.get("price_no") or 0
+            market_resolved = bool(m.get("resolved"))
     except Exception as e:
         log.debug(f"resolve price fetch err: {e}")
 
     our_price = price_yes if outcome == "UP" else price_no
-    market_decided = our_price >= 97 or (our_price <= 3 and (price_yes or price_no))
+    # ВАЖНО (фикс фантомных исходов 27.08.2026, кейс SOL 20:30): пока рынок
+    # официально НЕ разрешён (umaResolutionStatus != resolved), его
+    # outcomePrices — это ЖИВАЯ котировка, а не результат. Проигравший исход
+    # может торговаться по 97-99¢ вплоть до момента, когда оракул развернёт
+    # его в 0 (так и было: рынок разрешился против нас через 52с после конца
+    # окна, а старая логика успевала записать «победу» по 99¢). Поэтому
+    # ценовой вердикт принимаем ТОЛЬКО после официального разрешения; до
+    # него — ждём разрешение либо сверяемся со свечой (ниже).
+    market_decided = market_resolved and (
+        our_price >= 97 or (our_price <= 3 and (price_yes or price_no))
+    )
     opposite = "DOWN" if outcome == "UP" else "UP"
+    if (not market_resolved and (our_price >= 97 or our_price <= 3)):
+        log.info(
+            f"liq: {symbol} '{outcome}' торгуется по {our_price}¢, но рынок ещё "
+            f"не разрешён официально — котировке не верим, ждём расчёта"
+        )
 
     # 2. Свеча окна (фолбэк)
     wc = await get_window_candle(session, symbol, tf, window_start, force=True)
@@ -4101,12 +4153,12 @@ async def _resolve_after_window(context, cid, session, c, state, symbol, pos):
     source = ""
     note = ""
     if market_decided:
-        # Рынок уже всё решил — его вердикт авторитетен даже против свечи.
+        # Рынок ОФИЦИАЛЬНО разрешён — его вердикт авторитетен даже против свечи.
         result = outcome if our_price >= 97 else opposite
-        source = "цена рынка"
+        source = "официальное разрешение рынка"
         if candle_result and candle_result != result:
             note = (f"⚠️ свеча {candle_result} расходится с рынком ({result}) — "
-                    f"доверяю рынку: он определяет выплату")
+                    f"доверяю официальному расчёту рынка: он определяет выплату")
             log.warning(
                 f"liq: ⚠️ {symbol} свеча {candle_result} ≠ рынок {result} "
                 f"(yes {price_yes}¢ / no {price_no}¢) — беру результат рынка"

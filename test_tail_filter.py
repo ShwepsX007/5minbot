@@ -16,6 +16,11 @@
      Polymarket рассчитывает рынки 5m/15m/1h (раздел 9).
   7. FAK-тейк отката по первой ставке: гейт по шагу/времени окна и
      демо-исполнение (раздел 10).
+  8. Вердикт по позиции — только после ОФИЦИАЛЬНОГО разрешения рынка:
+     котировка 97-99¢ до разрешения больше не считается итогом
+     (раздел 11, кейс SOL 20:30 27.08.2026).
+  9. Цены выходов (аварийный выход, тейки) берутся из живого стакана
+     CLOB, а не из отстающей гаммы (раздел 12, кейс XRP 21:10).
 """
 import asyncio
 import os
@@ -594,6 +599,136 @@ async def main():
     check("ручной ввод уровня 75¢", ok and norm == "75", err)
     ok, norm, err = liq_menu.validate_manual_input("liq_tp_first_sec", "999")
     check("окно 999с > максимума 240 → ошибка", not ok)
+
+    print("\n=== 11. Вердикт только после официального разрешения рынка ===")
+    # Кейс SOL 20:30 27.08.2026: рынок торговал наш исход по 99¢, но через
+    # 52 секунды официально разрешился ПРОТИВ нас. Старая логика принимала
+    # 99¢ за итог и записывала фантомную победу.
+    pt_stub = sys.modules["polymarket_trading"]
+    real_get_em = getattr(pt_stub, "get_event_markets", None)
+    real_get_lp = getattr(pt_stub, "get_live_price", None)
+    real_settle = ls._settle_position
+    real_gwc = getattr(ls, "get_window_candle", None)
+    settle_calls = []
+
+    async def fake_settle(context, cid, c, state, symbol, pos, **kw):
+        settle_calls.append({"symbol": symbol, **kw})
+
+    async def no_candle(*a, **kw):
+        return None
+
+    ls._settle_position = fake_settle
+    ls.get_window_candle = no_candle
+    try:
+        now_r = time.time()
+        c_r = dict(ls.DEFAULTS)
+        c_r["liq_timeframe"] = "5m"
+        base_pos = {"slug": "sol-updown-5m-test", "outcome": "UP",
+                    "window_start": now_r - 305, "window_end": now_r - 5,
+                    "entry_cents": 53, "shares": 1.88, "stake": 1.0,
+                    "series": 0, "is_demo": 1, "token_id": "tok_up"}
+        st = {"positions": {"SOL": dict(base_pos)}}
+
+        # 1. Рынок НЕ разрешён официально, но котировка 99¢ → ждём, вердикт
+        #    не выносим (это и была фантомная победа).
+        pt_stub.get_event_markets = lambda slug: {"markets": [{
+            "question": "Sol", "price_yes": 99, "price_no": 1,
+            "resolved": False}]}
+        await ls._resolve_after_window(None, 1, None, c_r, st, "SOL",
+                                       st["positions"]["SOL"])
+        check("99¢ без официального разрешения → ждём, НЕ победа",
+              len(settle_calls) == 0
+              and st["positions"]["SOL"].get("awaiting_resolution") == 1,
+              str(settle_calls))
+
+        # 2. Рынок официально разрешился против нас → честный LOSS по 0¢.
+        pt_stub.get_event_markets = lambda slug: {"markets": [{
+            "question": "Sol", "price_yes": 0, "price_no": 100,
+            "resolved": True}]}
+        await ls._resolve_after_window(None, 1, None, c_r, st, "SOL",
+                                       st["positions"]["SOL"])
+        check("официальное разрешение против нас → LOSS по 0¢",
+              len(settle_calls) == 1 and settle_calls[0]["win"] is False
+              and settle_calls[0]["close_price"] == 0, str(settle_calls))
+        check("reason указывает официальное разрешение рынка",
+              "официальное разрешение" in str(
+                  settle_calls[0].get("reason", "")))
+
+        # 3. Официальное разрешение в нашу пользу → WIN по 100¢.
+        st2 = {"positions": {"SOL": dict(base_pos)}}
+        pt_stub.get_event_markets = lambda slug: {"markets": [{
+            "question": "Sol", "price_yes": 100, "price_no": 0,
+            "resolved": True}]}
+        await ls._resolve_after_window(None, 1, None, c_r, st2, "SOL",
+                                       st2["positions"]["SOL"])
+        check("официальное разрешение в нашу пользу → WIN по 100¢",
+              len(settle_calls) == 2 and settle_calls[1]["win"] is True
+              and settle_calls[1]["close_price"] == 100, str(settle_calls))
+
+        print("\n=== 12. Выходы по живому стакану, а не по отставшей гамме ===")
+        # Кейс XRP 21:10 27.08.2026: гамма показывала 52¢, хотя рынок уже
+        # шёл против нас; демо фиксировал «спасение в плюс» по 52¢. Теперь
+        # цена берётся из живого стакана (best bid).
+        settle_calls.clear()
+        pt_stub.get_event_markets = lambda slug: {"markets": [{
+            "question": "Xrp", "price_yes": 52, "price_no": 48}]}
+        pt_stub.get_live_price = lambda tid: {"bid": 15, "ask": 18, "mid": 17}
+        pos_x = {"slug": "xrp-updown-5m-test", "outcome": "UP",
+                 "window_start": now_r - 298, "window_end": now_r + 2,
+                 "entry_cents": 51, "shares": 1.96, "stake": 1.0,
+                 "series": 1, "is_demo": 1, "token_id": "tok_xrp"}
+        st_x = {"positions": {"XRP": dict(pos_x)}}
+        await ls._check_open_position(None, 1, None, c_r, st_x, "XRP",
+                                      st_x["positions"]["XRP"])
+        check("аварийный выход: спасение по живому биду 15¢, а не гамме 52¢",
+              len(settle_calls) == 1 and settle_calls[0]["win"] is False
+              and settle_calls[0]["close_price"] == 15, str(settle_calls))
+        check("reason отмечает источник цены (живой стакан)",
+              "живой стакан" in str(settle_calls[0].get("reason", "")),
+              str(settle_calls[0].get("reason", "")))
+
+        # Стакан недоступен → откатываемся к цене гаммы (старое поведение).
+        settle_calls.clear()
+        pt_stub.get_live_price = lambda tid: None
+        st_x2 = {"positions": {"XRP": dict(pos_x)}}
+        await ls._check_open_position(None, 1, None, c_r, st_x2, "XRP",
+                                      st_x2["positions"]["XRP"])
+        check("нет стакана → спасение по гамме 52¢ (фолбэк)",
+              len(settle_calls) == 1 and settle_calls[0]["win"] is False
+              and settle_calls[0]["close_price"] == 52, str(settle_calls))
+
+        # FAK-тейк первой ставки тоже берёт живой бид вместо гаммы.
+        settle_calls.clear()
+        pt_stub.get_event_markets = lambda slug: {"markets": [{
+            "question": "Test ETH", "price_yes": 78, "price_no": 22}]}
+        pt_stub.get_live_price = lambda tid: {"bid": 79, "ask": 80, "mid": 79}
+        pos_ft = {"series": 0, "window_start": now_r - 5,
+                  "window_end": now_r + 295, "outcome": "UP",
+                  "entry_cents": 51, "shares": 10.0, "is_demo": 1,
+                  "slug": "eth-updown-5m-test", "token_id": "tok_eth"}
+        r = await ls._try_first_take(None, 1, c_full, {}, sym, dict(pos_ft))
+        check("FAK-тейк: демо закрывает по живому биду 79¢ (гамма 78¢)",
+              r is True and len(settle_calls) == 1
+              and settle_calls[0]["close_price"] == 79, str(settle_calls))
+
+        # Живой бид НИЖЕ уровня тейка → не закрываем, даже если гамма выше.
+        settle_calls.clear()
+        pt_stub.get_live_price = lambda tid: {"bid": 60, "ask": 62, "mid": 61}
+        r = await ls._try_first_take(None, 1, c_full, {}, sym, dict(pos_ft))
+        check("гамма 78¢, но живой бид 60¢ < 75¢ → тейк НЕ исполняем",
+              r is False and len(settle_calls) == 0, str(settle_calls))
+    finally:
+        ls._settle_position = real_settle
+        ls.get_window_candle = real_gwc
+        for name, real in (("get_event_markets", real_get_em),
+                           ("get_live_price", real_get_lp)):
+            if real is not None:
+                setattr(pt_stub, name, real)
+            else:
+                try:
+                    delattr(pt_stub, name)
+                except AttributeError:
+                    pass
 
     print(f"\nИТОГ: {PASS} прошло, {FAIL} упало")
     return FAIL
