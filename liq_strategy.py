@@ -177,6 +177,12 @@ async def _send(context, cid, text, **kwargs):
 
 GATE_BASE = liq_api.GATE_BASE
 
+# Версия логики ликвидаций. Показывается в статус-экране, чтобы из
+# Telegram было видно, перезапущен ли бот с новым кодом. Обновлять при
+# каждом значимом изменении логики.
+STRATEGY_VERSION = ("27.08.2026 #3 — свеча из 60с TWAP (как рынок), "
+                    "ожидание расчёта 300с, FAK-тейк 1-й ставки")
+
 # ===================== ПАРАМЕТРЫ ПО УМОЛЧАНИЮ =====================
 DEFAULTS = {
     "liq_active":        "0",
@@ -1457,6 +1463,7 @@ def get_status_text() -> str:
     else:
         lines.append(f"💱 Пары: *не выбраны* (открой ⚙️ Настройки) | ⏱ ТФ: `{c['liq_timeframe']}`")
     lines.append(f"🎮 Режим: {'ДЕМО' if is_demo_mode else 'РЕАЛ'}")
+    lines.append(f"⚙️ Версия логики: `{STRATEGY_VERSION}`")
     entry_mode = get_entry_mode()
     entry_mode_pretty = "🚀 Рыночный (по лучшей цене)" if entry_mode == "market" else "📋 Лимитный (по цене из настроек)"
     lines.append(f"🎯 Тип входа: *{entry_mode_pretty}*")
