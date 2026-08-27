@@ -11,7 +11,17 @@
        свеча DOWN + ликвидируют ЛОНГОВ → входим UP  (контр-трейд)
        свеча UP   + ликвидируют ШОРТОВ → входим DOWN
      Если свеча и каскад смотрят в разные стороны — сигнал пропускаем.
-  4. Вход в СЛЕДУЮЩЕЕ окно, по рынку или лимиткой (liq_entry_mode).
+  4. ФИЛЬТР ХВОСТА ЛИКВИДАЦИЙ (liq_tail_*): перед самым входом бот ещё
+     раз смотрит ВСЕ ликвидации за окно liq_window_sec и выделяет
+     последние liq_tail_sec секунд («хвост»). Если доля объёма хвоста
+     от всего окна ВЫШЕ/НИЖЕ liq_tail_pct процентов (режим
+     liq_tail_mode) — бот НЕ входит.
+  5. Вход в СЛЕДУЮЩЕЕ окно, по рынку или лимиткой (liq_entry_mode).
+
+Если вход отменил фильтр, сигналы по этой монете ставятся на паузу
+(liq_signal_cooldown_sec): отменённый каскад ещё какое-то время
+превышает порог в окне агрегации, и без паузы бот тут же принял бы его
+как «новый» сигнал и вошёл со второй попытки.
 
 ВЫХОД:
   1. Достигнут liq_tp_cents → продаём (лимиткой на TP, а если позиция
@@ -20,13 +30,22 @@
      окна, то есть где цена относительно старта рынка:
        • идёт в нашу сторону → НЕ закрываемся досрочно, ждём расчёта
          (раньше бот здесь сливал выигрышные позиции по 40¢);
-       • идёт против нас → шаг проигран: спасаем остаток продажей и
-         сразу открываем следующее окно в ТУ ЖЕ сторону с мартингейлом.
+       • идёт против нас → шаг проигран: спасаем остаток продажей.
   3. После конца окна итог определяем по закрытой свече этого окна
      (с перепроверкой ценой рынка). Выигрыш — серия сброшена, проигрыш —
      следующий шаг мартингейла в ту же сторону.
 
-Мартингейл идёт по таймеру внутри серии и не ждёт нового каскада.
+ПОВТОРНЫЙ ВХОД ПОСЛЕ УБЫТКА (liq_mg_entry = signal):
+  Бот оценивает УБЫТОЧНУЮ свечу тем же фильтром хвоста: все ликвидации
+  за окно liq_window_sec и последние liq_tail_sec секунд.
+    • хвост ПРОШЁЛ → бот входит в окно, следующее СРАЗУ за убыточным,
+      без ожидания и пропусков;
+    • хвост ЗАБЛОКИРОВАН → окно сразу после убытка пропускается; бот
+      ждёт, пока фильтр хвоста пустит одно из следующих окон (проверка
+      в конце каждого окна). Убыточное окно считается первым
+      заблокированным; после liq_mg_skip_windows заблокированных окон —
+      вход лотом liq_mg_skip_lot_pct% или остановка серии (при 0%).
+  При liq_mg_entry = timer — старое поведение: вход сразу по таймеру.
 """
 
 import json
@@ -79,6 +98,7 @@ def md_escape(text) -> str:
 STAT_KEYS = (
     "liq_stat_signals",        # сигналов принято в очередь
     "liq_stat_candle_cancel",  # отменено перепроверкой свечи
+    "liq_stat_filter_tail",    # отменено фильтром хвоста ликвидаций
     "liq_stat_filter_impulse",  # отменено фильтром импульса
     "liq_stat_filter_oi",      # отменено фильтром OI
     "liq_stat_filter_cvd",     # отменено фильтром потока
@@ -112,13 +132,14 @@ def _funnel_line() -> str:
         return ("🔻 Воронка сигналов: пока пусто — как появятся сигналы, "
                 "здесь будет видно работу фильтров")
     cc = _stat("liq_stat_candle_cancel")
+    ft = _stat("liq_stat_filter_tail")
     fi = _stat("liq_stat_filter_impulse")
     fo = _stat("liq_stat_filter_oi")
     fc = _stat("liq_stat_filter_cvd")
     ent = _stat("liq_stat_entries")
     return (f"🔻 Воронка: сигналов *{sig}* → свеча отсеяла *{cc}* → "
-            f"фильтры *{fi + fo + fc}* (импульс {fi} / OI {fo} / CVD {fc}) → "
-            f"входов *{ent}*")
+            f"фильтры *{ft + fi + fo + fc}* (хвост {ft} / импульс {fi} / "
+            f"OI {fo} / CVD {fc}) → входов *{ent}*")
 
 
 def _last_filters_line() -> str:
@@ -199,8 +220,12 @@ DEFAULTS = {
     # Сколько секунд после конца окна ждать ОФИЦИАЛЬНОГО расчёта рынка
     # Polymarket, прежде чем принять результат по свече. Пока время не
     # вышло и рынок не рассчитался — бот ждёт: цена рынка авторитетнее
-    # свечи, именно она определяет выплату.
-    "liq_market_confirm_wait": "120",
+    # свечи, именно она определяет выплату. 300с по умолчанию: рынки
+    # обычно резолвятся за 1–4 минуты, а гамма-АПИ иногда отражает
+    # исход с задержкой (27.08.2026: расчёт в 15:55:54, цены исходов
+    # обновились только к 15:59:15 — при 120с бот успел поверить свече
+    # и записал фантомный «плюс»).
+    "liq_market_confirm_wait": "300",
     # За сколько секунд до конца сигнальной свечи перепроверяем её
     # направление перед входом в следующее окно.
     "liq_entry_confirm_sec": "2",
@@ -227,17 +252,51 @@ DEFAULTS = {
     #   "classic"  — по старой схеме: первый лот × множитель^номер шага.
     "liq_martingale_mode": "recovery",
 
-    # ===== ШАГИ МАРТИНГЕЙЛА ТОЛЬКО ПО СВЕЖЕМУ СИГНАЛУ =====
-    # "signal" — вход в следующее окно только при подтверждении: живая
-    #            свеча нового окна идёт в нашу сторону ИЛИ случился
-    #            микро-каскад ликвидаций в нашу пользу;
-    # "timer"  — старое поведение: вход сразу по таймеру без подтверждения.
+    # ===== ШАГИ МАРТИНГЕЙЛА: ПОВТОРНЫЙ ВХОД ЧЕРЕЗ ФИЛЬТР ХВОСТА =====
+    # "signal" — после убытка бот оценивает УБЫТОЧНУЮ свечу фильтром
+    #            хвоста ликвидаций (настройки liq_tail_* ниже):
+    #              • хвост прошёл → вход в окно СРАЗУ за убыточным,
+    #                без ожидания и пропусков;
+    #              • хвост заблокирован → окно после убытка
+    #                пропускается, бот ждёт прохождения фильтра на
+    #                следующих окнах (убыточное окно — первый блок,
+    #                см. лимит пропусков ниже);
+    # "timer"  — старое поведение: вход сразу по таймеру без проверки.
     "liq_mg_entry": "signal",
-    # Сколько окон максимум ПРОПУСКАТЬ в ожидании подтверждения (1-3).
+    # Сколько окон максимум пропустить БЕЗ ВХОДА, когда фильтр хвоста
+    # блокирует продолжение серии (убыточное окно считается первым
+    # заблокированным). После лимита — вход лотом «после пропусков»
+    # или остановка серии (0-5).
     "liq_mg_skip_windows": "2",
     # Лот после исчерпания пропусков, % от расчётного (0 — остановить
     # серию, 100 — войти полным лотом).
     "liq_mg_skip_lot_pct": "50",
+
+    # ===== ФИЛЬТР ХВОСТА ЛИКВИДАЦИЙ =====
+    # Перед самым входом бот ещё раз смотрит ВСЕ ликвидации за окно
+    # агрегации liq_window_sec и выделяет последние liq_tail_sec секунд
+    # («хвост» окна). Доля ОБЪЁМА ликвидаций хвоста сравнивается с
+    # порогом liq_tail_pct (в % от всего окна):
+    #   режим "above" — доля хвоста ВЫШЕ порога → бот НЕ входит
+    #        (каскад сконцентрирован в самом конце окна: движение,
+    #        скорее всего, ещё продолжается, отката пока нет);
+    #   режим "below" — доля хвоста НИЖЕ порога → бот НЕ входит
+    #        (каскад затух, «топлива» для отката уже нет).
+    # Пример: окно 300с, хвост 50с, порог 50%, режим above — если за
+    # последние 50 секунд прошло больше 50% ликвидаций всего окна,
+    # вход отменяется.
+    # liq_tail_sec = 0 — фильтр выключен.
+    "liq_tail_sec": "50",
+    "liq_tail_pct": "50",
+    "liq_tail_mode": "above",
+
+    # ===== ПАУЗА СИГНАЛОВ ПОСЛЕ ОТМЕНЫ ФИЛЬТРОМ =====
+    # Когда вход по монете отменил фильтр (хвост/импульс/OI/CVD), тот же
+    # самый каскад ликвидаций продолжает «светиться» в окне агрегации, и
+    # без паузы бот тут же принял бы его как «новый» сигнал и вошёл со
+    # второй попытки. Эта настройка — сколько секунд после отмены не
+    # принимать сигналы по данной монете. 0 — пауза выключена.
+    "liq_signal_cooldown_sec": "120",
 
     # ===== ФИЛЬТРЫ ИСПОЛНЕНИЯ =====
     # Максимальный спред bid-ask для входа, ¢ (0 — выключено).
@@ -259,6 +318,11 @@ DEFAULTS = {
 SIGNAL_CANDLE_BASIS = ("current", "prev")
 
 MARTINGALE_MODES = ("recovery", "classic")
+
+# Режимы фильтра хвоста ликвидаций:
+#   "above" — не входить, если доля хвоста ВЫШЕ порога;
+#   "below" — не входить, если доля хвоста НИЖЕ порога.
+TAIL_MODES = ("above", "below")
 
 MIN_SIZE_MODES = ("skip", "bump")
 CANDLE_SOURCES = ("chainlink", "gate_spot")
@@ -406,7 +470,7 @@ def set_param(key, value):
 def _empty_state() -> dict:
     """Свежее состояние: серии, позиции, отложенные входы и PnL серий."""
     return {"series": {}, "positions": {}, "pending": {}, "series_pnl": {},
-            "mg_pending": {}}
+            "mg_pending": {}, "cooldowns": {}}
 
 
 def _load_state() -> dict:
@@ -437,6 +501,9 @@ def _load_state() -> dict:
         st.setdefault("mg_pending", {})
         if not isinstance(st.get("mg_pending"), dict):
             st["mg_pending"] = {}
+        st.setdefault("cooldowns", {})
+        if not isinstance(st.get("cooldowns"), dict):
+            st["cooldowns"] = {}
         st.setdefault("series_pnl", {})
         if not isinstance(st["series_pnl"], dict):
             st["series_pnl"] = {}
@@ -741,10 +808,164 @@ def get_entry_mode() -> str:
 
 
 def get_mg_entry_mode() -> str:
-    """Шаги мартингейла: 'signal' — только по свежему подтверждению,
+    """Шаги мартингейла: 'signal' — повторный вход через фильтр хвоста,
     'timer' — сразу по таймеру (старое поведение)."""
     v = str(get_setting("liq_mg_entry", DEFAULTS["liq_mg_entry"]) or "").strip().lower()
     return v if v in ("signal", "timer") else "signal"
+
+
+def get_tail_mode() -> str:
+    """Режим фильтра хвоста: 'above' — блок, если доля хвоста выше порога,
+    'below' — блок, если ниже."""
+    v = str(get_setting("liq_tail_mode", DEFAULTS["liq_tail_mode"]) or "").strip().lower()
+    return v if v in TAIL_MODES else "above"
+
+
+def get_tail_filter_cfg() -> tuple[int, float, str]:
+    """Параметры фильтра хвоста ликвидаций: (tail_sec, pct, mode).
+
+    tail_sec — сколько последних секунд окна агрегации считать «хвостом»
+    (0 — фильтр выключен);
+    pct — порог доли хвоста в % от всего окна;
+    mode — 'above' / 'below' (см. get_tail_mode).
+    """
+    try:
+        tail_sec = int(float(get_setting("liq_tail_sec",
+                                         DEFAULTS["liq_tail_sec"]) or 0))
+    except (TypeError, ValueError):
+        tail_sec = 50
+    tail_sec = max(0, min(600, tail_sec))
+    try:
+        pct = float(get_setting("liq_tail_pct",
+                                DEFAULTS["liq_tail_pct"]) or 0)
+    except (TypeError, ValueError):
+        pct = 50.0
+    pct = max(0.0, min(100.0, pct))
+    return tail_sec, pct, get_tail_mode()
+
+
+def eval_tail_filter(symbol: str, now: float | None = None) -> dict:
+    """Фильтр хвоста ликвидаций.
+
+    Берём ВСЕ ликвидации за окно агрегации liq_window_sec (окно скользящее,
+    заканчивается «сейчас» — ровно то окно, из которого берутся ликвидации
+    для сигнала) и выделяем последние liq_tail_sec секунд («хвост» —
+    «за N секунд до конца периода»). Доля ОБЪЁМА ликвидаций хвоста
+    сравнивается с порогом liq_tail_pct:
+
+      режим "above" — доля хвоста ВЫШЕ порога → блок (не входить);
+      режим "below" — доля хвоста НИЖЕ порога → блок (не входить).
+
+    Один и тот же принцип используется в двух местах:
+      1. перед первичным входом по сигналу (см. check_entry_filters);
+      2. перед повторным входом после убытка — оценивается убыточная
+         свеча (см. планировщик мартингейла в _settle_position).
+
+    Возвращает словарь с цифрами и вердиктом:
+      enabled, blocked, why, share_pct, window_usd, tail_usd,
+      window_cnt, tail_cnt, window_sec, tail_sec, pct, mode.
+    """
+    now = time.time() if now is None else now
+    tail_sec, pct, mode = get_tail_filter_cfg()
+    try:
+        window_sec = cfg_int("liq_window_sec")
+    except Exception:
+        window_sec = 60
+
+    res = {
+        "enabled": tail_sec > 0,
+        "blocked": False,
+        "why": "",
+        "share_pct": 0.0,
+        "window_usd": 0.0,
+        "tail_usd": 0.0,
+        "window_cnt": 0,
+        "tail_cnt": 0,
+        "window_sec": window_sec,
+        "tail_sec": tail_sec,
+        "pct": pct,
+        "mode": mode,
+    }
+    if tail_sec <= 0:
+        res["why"] = "фильтр хвоста выключен (liq_tail_sec = 0)"
+        return res
+
+    # Хвост не может быть длиннее самого окна агрегации.
+    tail_span = min(tail_sec, window_sec)
+    res["tail_sec"] = tail_span
+    win_from = now - window_sec
+    tail_from = now - tail_span
+    for e in _events_buffer.get(symbol, []):
+        t = float(e.get("time", 0) or 0)
+        if t < win_from:
+            continue
+        usd = float(e.get("usd_value", 0) or 0)
+        res["window_usd"] += usd
+        res["window_cnt"] += 1
+        if t >= tail_from:
+            res["tail_usd"] += usd
+            res["tail_cnt"] += 1
+
+    total = res["window_usd"]
+    # Пустое окно = 0% хвоста: в режиме "above" это не блок, в "below" —
+    # блок (каскада фактически нет, «топлива» для отката не осталось).
+    share = (res["tail_usd"] / total * 100.0) if total > 0 else 0.0
+    res["share_pct"] = share
+
+    nums = (f"хвост {tail_span}с: ${res['tail_usd']:,.0f} "
+            f"({res['tail_cnt']} ликв.) = {share:.0f}% от окна "
+            f"{window_sec}с (${total:,.0f}, {res['window_cnt']} ликв.)")
+    if mode == "above" and share > pct:
+        res["blocked"] = True
+        res["why"] = (f"{nums} — выше порога {pct:g}%: каскад "
+                      f"сконцентрирован в конце окна, движение может "
+                      f"продолжаться")
+    elif mode == "below" and share < pct:
+        res["blocked"] = True
+        res["why"] = (f"{nums} — ниже порога {pct:g}%: каскад затух, "
+                      f"отката ждать не стоит")
+    else:
+        res["why"] = f"{nums} — условие блокировки ({mode} {pct:g}%) не сработало"
+    return res
+
+
+def get_signal_cooldown_sec() -> int:
+    """Сколько секунд после отмены входа фильтром не принимать сигналы
+    по этой монете. 0 — пауза выключена."""
+    try:
+        v = int(float(get_setting("liq_signal_cooldown_sec",
+                                  DEFAULTS["liq_signal_cooldown_sec"]) or 0))
+    except (TypeError, ValueError):
+        v = 120
+    return max(0, min(600, v))
+
+
+def _signal_cooldown_left(state: dict, symbol: str) -> int:
+    """Сколько ещё секунд сигналы по монете на паузе после отмены фильтром.
+    0 — паузы нет."""
+    try:
+        ts = float((state.get("cooldowns") or {}).get(symbol, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    if ts <= 0:
+        return 0
+    left = ts + get_signal_cooldown_sec() - time.time()
+    return max(0, int(left))
+
+
+def _set_signal_cooldown(symbol: str):
+    """Ставит сигналы монеты на паузу (см. get_signal_cooldown_sec).
+
+    Вызывается при отмене входа фильтром: тот же каскад ликвидаций
+    остаётся в окне агрегации и без паузы немедленно повторно прошёл бы
+    как «свежий» сигнал.
+    """
+    cd = get_signal_cooldown_sec()
+    if cd <= 0:
+        return
+    state = _load_state()
+    state.setdefault("cooldowns", {})[symbol] = time.time()
+    _save_state(state)
 
 
 def get_max_entry_cents() -> int:
@@ -1108,6 +1329,14 @@ def _filters_detail_line(details: dict) -> str:
     if not details:
         return "Данных фильтров нет."
     parts = []
+    if "tail" in details:
+        t = details["tail"]
+        mode_txt = "выше" if t.get("mode") == "above" else "ниже"
+        parts.append(
+            f"хвост {t.get('tail_sec', 0)}с: {t.get('share_pct', 0):.0f}% окна "
+            f"(${t.get('tail_usd', 0):,.0f} из ${t.get('window_usd', 0):,.0f}), "
+            f"порог {mode_txt} {t.get('pct', 0):g}%"
+        )
     if "oi_change_pct" in details:
         by_ex = details.get("oi_by_exchange") or {}
         if by_ex:
@@ -1130,8 +1359,14 @@ def _filters_status_line() -> str:
     streak = int(_f("liq_filter_impulse", 0))
     oi_lim = _f("liq_filter_oi_pct", 0)
     cvd_lim = _f("liq_filter_cvd", 0)
+    tail_sec, tail_pct, tail_mode = get_tail_filter_cfg()
 
     bits = []
+    if tail_sec > 0:
+        mode_txt = "выше" if tail_mode == "above" else "ниже"
+        bits.append(f"хвост {tail_sec}с/{tail_pct:g}% ({mode_txt})")
+    else:
+        bits.append("хвост ⛔")
     bits.append(f"импульс {streak} св./{_f('liq_filter_impulse_pct', 0):.2f}%"
                 if streak > 0 else "импульс ⛔")
     bits.append(f"OI +{oi_lim:.2f}%" if oi_lim > 0 else "OI ⛔")
@@ -1300,6 +1535,9 @@ def get_status_text() -> str:
                     )
                 else:
                     lines.append(f"{status_emoji} `{sym}` свободна | серия {ser}/{c['liq_max_series']} | буфер {buf} за 600с")
+            cd_left = _signal_cooldown_left(st, sym)
+            if cd_left > 0:
+                lines.append(f"   🧊 Сигналы на паузе ещё *{cd_left}с* (после отмены входа фильтром)")
             lines.append("")
     else:
         lines.append("📭 *Не выбрано ни одной пары — открой ⚙️ Настройки.*")
@@ -1317,10 +1555,10 @@ def get_status_text() -> str:
             )
         lines.append("")
 
-    # === Шаги мартингейла, ждущие подтверждения окна ===
+    # === Шаги мартингейла, ждущие окна, которое пустит фильтр хвоста ===
     mg_pending = st.get("mg_pending") or {}
     if mg_pending:
-        lines.append("👀 *Мартингейл ждёт подтверждения окна:*")
+        lines.append("👀 *Мартингейл ждёт окно, которое пустит фильтр хвоста:*")
         for sym, req in mg_pending.items():
             lines.append(
                 f"   `{sym}` → *{req.get('outcome','?')}* | шаг {req.get('series','?')} "
@@ -2038,6 +2276,22 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
         )
         return
 
+    # === Пауза сигналов после отмены входа фильтром ===
+    # Отменённый каскад продолжает превышать порог, пока не устареет в
+    # окне агрегации. Без паузы бот на следующем же тике принял бы ТУ ЖЕ
+    # самую ликвидационную волну как «новый» сигнал и вошёл со второй
+    # попытки — сразу после того, как фильтр её забраковал.
+    cd_left = _signal_cooldown_left(state, symbol)
+    if cd_left > 0:
+        set_setting(
+            "liq_last_scan",
+            f"[{symbol}] каскад {agg['dominant']} ${agg['total_usd']:,.0f} — "
+            f"сигналы на паузе ещё {cd_left}с (отмена фильтром)",
+        )
+        log.info(f"Signal {symbol}: каскад ${agg['total_usd']:.0f} — пауза после "
+                 f"отмены фильтром, ещё {cd_left}с, сигнал не принимаю")
+        return
+
     # Финальная защита: проверяем can_open_for ещё раз непосредственно
     # перед входом — между решением scan_for_signal и записью позиции в
     # state могло что-то измениться (гонка задач, _check_open_position
@@ -2069,74 +2323,53 @@ def get_entry_confirm_sec() -> int:
     return max(1, min(60, v))
 
 
-# ===================== МАРТИНГЕЙЛ ПО СВЕЖЕМУ СИГНАЛУ =====================
-# Через сколько секунд после начала окна проверяем подтверждение: свеча
-# должна успеть сформироваться, иначе «направление» — это шум первой секунды.
-MG_CONFIRM_AT_SEC = 45
-# Минимальный остаток окна для входа после подтверждения.
-MG_MIN_LEFT_SEC = 60
+# ===================== МАРТИНГЕЙЛ ЧЕРЕЗ ФИЛЬТР ХВОСТА =====================
+# За сколько секунд ДО КОНЦА окна проверяем фильтр хвоста ликвидаций:
+# к этому моменту хвост («последние liq_tail_sec секунд окна») уже
+# накопился и его долю можно посчитать. После проверки вход происходит
+# в следующее окно.
+MG_TAIL_LEAD_SEC = 5
 
 _mg_lock = asyncio.Lock()
 
 
 async def _mg_window_confirmed(session, symbol: str, tf: str,
                                outcome: str, window_start: float) -> tuple[bool, str]:
-    """Есть ли свежее подтверждение входа в сторону outcome.
+    """Подтверждено ли окно для шага мартингейла.
 
-    Считается подтверждением:
-      1. Живая свеча текущего окна идёт в нашу сторону (close > open для UP);
-      2. Микро-каскад ликвидаций за окно агрегации в контр-направлении
-         (лонги вылетают → поддержка UP, шорты → поддержка DOWN) — та же
-         логика, по которой работает основной сигнал стратегии.
+    Старое подтверждение («живая свеча окна идёт в нашу сторону или
+    микро-каскад ликвидаций в нашу пользу») работало некорректно и
+    заменено ФИЛЬТРОМ ХВОСТА ЛИКВИДАЦИЙ — тем же принципом, что и перед
+    первичным входом:
+
+      берём все ликвидации за окно liq_window_sec и последние
+      liq_tail_sec секунд; если доля хвоста ВЫШЕ/НИЖЕ liq_tail_pct
+      (режим liq_tail_mode) — окно НЕ подтверждено.
+
+    Если фильтр выключен (liq_tail_sec = 0) — окно считается
+    подтверждённым по умолчанию.
     """
-    # 1) Свеча окна
     try:
-        cndl = await get_window_candle(session, symbol, tf, window_start)
+        tail = eval_tail_filter(symbol)
     except Exception as e:
-        log.debug(f"mg confirm candle err: {e}")
-        cndl = None
-    if cndl and cndl.get("open"):
-        state_now = resolve_state(cndl)
-        delta_pct = (cndl["close"] - cndl["open"]) / cndl["open"] * 100
-        if state_now == outcome:
-            return True, (f"свеча окна идёт {state_now} ({delta_pct:+.3f}%) "
-                          f"— в нашу сторону")
-        return False, f"свеча окна идёт {state_now} ({delta_pct:+.3f}%) против {outcome}"
-
-    # 2) Микро-каскад
-    try:
-        c = cfg()
-        window_sec = int(float(c["liq_window_sec"]))
-        threshold = float(c["liq_threshold_usd"])
-        events = _events_buffer.get(symbol) or []
-        agg = liq_api.aggregate_liquidations(events, window_sec=window_sec)
-        total = float(agg.get("total_usd") or 0)
-        long_usd = float(agg.get("long_liq_usd") or 0)
-        short_usd = float(agg.get("short_liq_usd") or 0)
-        need = threshold * 0.3
-        if total >= need:
-            if long_usd > short_usd and outcome == "UP":
-                return True, (f"микро-каскад ${total:,.0f} (лонги ${long_usd:,.0f}) "
-                              f"— поддержка UP")
-            if short_usd > long_usd and outcome == "DOWN":
-                return True, (f"микро-каскад ${total:,.0f} (шорты ${short_usd:,.0f}) "
-                              f"— поддержка DOWN")
-            dom = "лонги" if long_usd >= short_usd else "шорты"
-            return False, f"каскад ${total:,.0f} не в нашу сторону (вылетают {dom})"
-        return False, f"каскад слабый (${total:,.0f} < ${need:,.0f})"
-    except Exception as e:
-        log.debug(f"mg confirm cascade err: {e}")
-        return False, "нет данных для подтверждения"
+        log.debug(f"mg tail filter err: {e}")
+        return False, "нет данных по ликвидациям для фильтра хвоста"
+    if not tail["enabled"]:
+        return True, "фильтр хвоста выключен"
+    if tail["blocked"]:
+        return False, tail["why"]
+    return True, tail["why"]
 
 
 async def process_mg_pending(context):
     """Проверяет окна для отложенных шагов мартингейла (режим signal).
 
     Вызывается из обоих джобов, поэтому нужен свой лок. Для каждой
-    записи mg_pending: дождаться момента проверки окна (старт + 45с),
-    проверить подтверждение и либо войти полным лотом, либо пропустить
-    окно (счётчик skips_used), либо после исчерпания пропусков войти
-    уменьшенным лотом lot_pct% (0 — остановить серию).
+    записи mg_pending: дождаться конца окна (за MG_TAIL_LEAD_SEC секунд
+    до его закрытия), прогнать фильтр хвоста ликвидаций и либо войти
+    полным лотом в следующее окно, либо пропустить окно (счётчик
+    skips_used), либо после исчерпания пропусков войти уменьшенным
+    лотом lot_pct% (0 — остановить серию).
     """
     if _mg_lock.locked():
         log.debug("process_mg_pending: уже выполняется, пропускаю тик")
@@ -2208,10 +2441,10 @@ async def _mg_pending_check_one(context, session, c, symbol: str, req: dict, now
     checked_window = int(req.get("checked_window") or 0)
     if checked_window == cur_start:
         return  # это окно уже проверяли — ждём следующего
-    if now < cur_start + MG_CONFIRM_AT_SEC:
-        return  # свеча ещё не сформировалась
-    if cur_end - now < MG_MIN_LEFT_SEC:
-        return  # окно почти кончилось — проверим следующее (не считая пропуском)
+    # Фильтр хвоста оценивается «за N секунд до конца периода»: ждём,
+    # пока хвост окна (последние liq_tail_sec секунд) накопится.
+    if now < cur_end - MG_TAIL_LEAD_SEC:
+        return
 
     confirmed, why = await _mg_window_confirmed(session, symbol, tf, outcome, cur_start)
 
@@ -2226,18 +2459,21 @@ async def _mg_pending_check_one(context, session, c, symbol: str, req: dict, now
     win_str = datetime.fromtimestamp(cur_start, tz=timezone.utc).strftime("%H:%M:%S UTC")
 
     if confirmed:
-        log.info(f"liq: ♻️ {symbol} шаг {series} подтверждён: {why}")
+        log.info(f"liq: ♻️ {symbol} шаг {series} прошёл фильтр хвоста: {why}")
         state.setdefault("mg_pending", {}).pop(symbol, None)
         _save_state(state)
         stake, _why = compute_stake(c, state, symbol, series)
         stake = round(stake, 2)
+        # Проверка прошла у самой границы окна — вход будет в СЛЕДУЮЩЕЕ
+        # окно. Даём Polymarket секунду на генерацию его слава.
+        await asyncio.sleep(1.0)
         await _enter_martingale_step(context, cid, c, state, symbol,
                                      stake, series, tf,
                                      carried_outcome=outcome,
-                                     entry_note=why)
+                                     entry_note=f"фильтр хвоста: {why}")
         return
 
-    # Не подтверждено
+    # Фильтр хвоста окно не пропустил
     skips_used = int(req.get("skips_used") or 0)
     if skips_used < max_skip:
         state = _load_state()
@@ -2245,12 +2481,12 @@ async def _mg_pending_check_one(context, session, c, symbol: str, req: dict, now
         if symbol in mg_map:
             mg_map[symbol]["skips_used"] = skips_used + 1
             _save_state(state)
-        log.info(f"liq: ⏭ {symbol} окно {win_str} без подтверждения ({why}) — "
+        log.info(f"liq: ⏭ {symbol} окно {win_str} не прошло фильтр хвоста ({why}) — "
                  f"пропуск {skips_used + 1}/{max_skip}")
         try:
             await _send(
                 context, cid,
-                f"⏭ *Окно без подтверждения* `{symbol}` {outcome}\n"
+                f"⏭ *Окно не прошло фильтр хвоста* `{symbol}` {outcome}\n"
                 f"🕐 {win_str}: {md_escape(why)}\n"
                 f"Пропускаю ({skips_used + 1}/{max_skip}), жду следующее окно.",
                 parse_mode="Markdown",
@@ -2266,33 +2502,34 @@ async def _mg_pending_check_one(context, session, c, symbol: str, req: dict, now
     if lot_pct > 0:
         stake, _why = compute_stake(c, state, symbol, series)
         stake = round(stake * lot_pct / 100.0, 2)
-        log.info(f"liq: {symbol} подтверждения нет {max_skip} окон — вход "
+        log.info(f"liq: {symbol} фильтр хвоста не пустил {max_skip} окон — вход "
                  f"лотом {stake}$ ({lot_pct:g}% от расчёта)")
         _save_state(state)
         try:
             await _send(
                 context, cid,
-                f"⚠️ *Подтверждения нет* `{symbol}` {outcome} за {max_skip} окон — "
+                f"⚠️ *Фильтр хвоста не пустил* `{symbol}` {outcome} за {max_skip} окон — "
                 f"вхожу лотом *{stake}$* ({lot_pct:g}% от расчётного).",
                 parse_mode="Markdown",
             )
         except Exception:
             pass
+        await asyncio.sleep(1.0)
         await _enter_martingale_step(context, cid, c, state, symbol,
                                      stake, series, tf,
                                      carried_outcome=outcome,
                                      entry_note=f"вход после {max_skip} окон без "
-                                                f"подтверждения, лот {lot_pct:g}%")
+                                                f"фильтра хвоста, лот {lot_pct:g}%")
     else:
         state["series"][symbol] = 0
         state.setdefault("series_pnl", {}).pop(symbol, None)
         _save_state(state)
-        log.info(f"liq: {symbol} подтверждения нет {max_skip} окон — серия остановлена")
+        log.info(f"liq: {symbol} фильтр хвоста не пустил {max_skip} окон — серия остановлена")
         try:
             await _send(
                 context, cid,
                 f"🛑 *Мартингейл остановлен* `{symbol}` {outcome}\n"
-                f"Подтверждения не дождались за {max_skip} окон "
+                f"Фильтр хвоста не пустил за {max_skip} окон "
                 f"(лот после пропусков = 0%). Ждём новый сигнал.",
                 parse_mode="Markdown",
             )
@@ -2489,9 +2726,36 @@ def _cvd_check(symbol: str, outcome: str, t0: float, t1: float,
 async def check_entry_filters(session, symbol: str, outcome: str, tf: str,
                               signal_window_start: float,
                               signal_window_end: float) -> tuple[bool, list, dict]:
-    """Фильтры безоткатных движений. Возвращает (можно_входить, причины, детали)."""
+    """Фильтры входа. Возвращает (можно_входить, причины, детали).
+
+    Первым идёт фильтр хвоста ликвидаций: перед самым входом бот ещё раз
+    смотрит ВСЕ ликвидации за окно агрегации и долю последних
+    liq_tail_sec секунд — если она выше/ниже порога (режим
+    liq_tail_mode), вход отменяется.
+    """
     reasons = []
     details = {}
+
+    # --- 0. Фильтр хвоста ликвидаций ---
+    tail_sec_cfg, _tail_pct_cfg, _tail_mode_cfg = get_tail_filter_cfg()
+    if tail_sec_cfg > 0:
+        try:
+            tail = eval_tail_filter(symbol)
+            details["tail"] = {
+                "share_pct": round(tail["share_pct"], 1),
+                "tail_usd": round(tail["tail_usd"]),
+                "window_usd": round(tail["window_usd"]),
+                "tail_cnt": tail["tail_cnt"],
+                "window_cnt": tail["window_cnt"],
+                "tail_sec": tail["tail_sec"],
+                "window_sec": tail["window_sec"],
+                "pct": tail["pct"],
+                "mode": tail["mode"],
+            }
+            if tail["blocked"]:
+                reasons.append(f"хвост ликвидаций: {tail['why']}")
+        except Exception as e:
+            log.debug(f"tail filter err: {e}")
 
     # --- 1. Импульс по свечам ---
     streak = int(_f("liq_filter_impulse", 0))
@@ -2680,8 +2944,14 @@ async def _process_pending_impl(context):
                 pass
 
             if not passed:
+                # Пауза приёма сигналов по монете: отменённый каскад ещё
+                # какое-то время превышает порог в окне агрегации, и без
+                # паузы бот сразу повторно принял бы его как «новый» сигнал.
+                _set_signal_cooldown(symbol)
                 for r in reasons:
-                    if "свеч" in r:
+                    if "хвост" in r:
+                        _bump_stat("liq_stat_filter_tail")
+                    elif "свеч" in r:
                         _bump_stat("liq_stat_filter_impulse")
                     elif "OI" in r:
                         _bump_stat("liq_stat_filter_oi")
@@ -2693,13 +2963,19 @@ async def _process_pending_impl(context):
                     "liq_last_scan",
                     f"[{symbol}] вход отменён фильтром: {reasons[0][:90]}",
                 )
+                cd_sec = get_signal_cooldown_sec()
+                cd_line = (f"\n\n🧊 *Пауза сигналов:* тот же каскад пока в окне "
+                           f"агрегации — повторные сигналы по `{symbol}` не "
+                           f"принимаю ещё *{cd_sec}с*."
+                           if cd_sec > 0 else "")
                 await _send(
                     context, cid,
                     f"🛑 *Вход отменён фильтром* `{symbol}` {outcome}\n"
                     + "\n".join(f"• {md_escape(r)}" for r in reasons)
                     + f"\n\n{md_escape(_filters_detail_line(details))}"
                     + "\n_Движение идёт без откатов — контр-трейд в такие "
-                      "моменты и даёт серии убытков._",
+                      "моменты и даёт серии убытков._"
+                    + cd_line,
                 )
                 continue
             log.info(f"liq: фильтры пройдены {symbol}: {details or 'все выключены'}")
@@ -3632,10 +3908,10 @@ async def _resolve_after_window(context, cid, session, c, state, symbol, pos):
 
     try:
         confirm_wait = int(float(get_setting(
-            "liq_market_confirm_wait", DEFAULTS["liq_market_confirm_wait"]) or 120))
+            "liq_market_confirm_wait", DEFAULTS["liq_market_confirm_wait"]) or 300))
     except (TypeError, ValueError):
-        confirm_wait = 120
-    confirm_wait = max(0, min(300, confirm_wait))
+        confirm_wait = 300
+    confirm_wait = max(0, min(600, confirm_wait))
 
     result = None
     source = ""
@@ -3665,11 +3941,18 @@ async def _resolve_after_window(context, cid, session, c, state, symbol, pos):
             return
         result = candle_result
         source = "свеча окна"
-        note = f"рынок не рассчитался за {confirm_wait}с — результат по свече, сверь с Polymarket"
+        csrc = str((wc or {}).get("src") or "")
+        if csrc.startswith("chainlink"):
+            note = (f"рынок не рассчитался за {confirm_wait}с — результат по "
+                    f"TWAP-свече Chainlink ({csrc}), сверь с Polymarket")
+        else:
+            note = (f"рынок не рассчитался за {confirm_wait}с — результат по ЗАПАСНОЙ свече "
+                    f"{csrc or '?'}: Polymarket считает по Chainlink TWAP, а не по споту, "
+                    f"направление могло разойтись — ОБЯЗАТЕЛЬНО сверь с Polymarket")
     else:
-        # Нет ни расчёта рынка, ни закрытой свечи. Ждём до 3 минут,
-        # потом решаем по цене.
-        if waited < 180:
+        # Нет ни расчёта рынка, ни закрытой свечи. Ждём не меньше
+        # confirm_wait (но хотя бы 3 минуты), потом решаем по цене.
+        if waited < max(180, confirm_wait):
             pos["awaiting_resolution"] = 1
             state["positions"][symbol] = pos
             _save_state(state)
@@ -3874,7 +4157,7 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
             + (f"🧭 {md_escape(reason)}\n" if reason else "")
             +
             f"📊 {stats_after['total']} WR {stats_after['winrate']}% PnL {stats_after['total_pnl']}$\n"
-            + ("⏳ Жду подтверждения следующего окна (свеча/микро-каскад)…\n"
+            + ("⏳ Оцениваю убыточную свечу фильтром хвоста ликвидаций…\n"
                if get_mg_entry_mode() == "signal"
                else "⏳ Сейчас вхожу в следующее окно с увеличенной ставкой…\n")
         )
@@ -3890,54 +4173,130 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     # Так как мы закрываемся в конце текущего окна, текущий
     # boundary уже истёк — следующее окно = (now // 5m + 1) * 5m.
     tf = c["liq_timeframe"]
+    entry_note = ""
 
     if get_mg_entry_mode() == "signal":
-        # === Режим signal: шаг войдёт ТОЛЬКО при подтверждении окна ===
-        # (живая свеча нового окна в нашу сторону или микро-каскад).
-        # Ждём до liq_mg_skip_windows окон; если подтверждения нет —
-        # вход уменьшенным лотом liq_mg_skip_lot_pct% или остановка серии.
+        # === Режим signal: повторный вход через ФИЛЬТР ХВОСТА ЛИКВИДАЦИЙ ===
+        # Убыточная свеча оценивается по тому же принципу, что и перед
+        # входом: все ликвидации за окно liq_window_sec и доля последних
+        # liq_tail_sec секунд («хвост»).
+        #   • хвост ПРОШЁЛ → входим в окно, следующее СРАЗУ за убыточным,
+        #     БЕЗ ожидания и пропусков;
+        #   • хвост ЗАБЛОКИРОВАН → в следующее окно не входим: ждём, пока
+        #     фильтр хвоста пустит одно из следующих окон (каждое
+        #     проверяется в конце). Убыточное окно считается ПЕРВЫМ
+        #     заблокированным. После liq_mg_skip_windows заблокированных
+        #     окон — вход лотом liq_mg_skip_lot_pct% или остановка серии
+        #     (при 0%).
         try:
-            max_skip = int(float(get_setting("liq_mg_skip_windows",
-                                             DEFAULTS["liq_mg_skip_windows"]) or 0))
-        except (TypeError, ValueError):
-            max_skip = 2
-        max_skip = max(0, min(5, max_skip))
-        try:
-            lot_pct = float(get_setting("liq_mg_skip_lot_pct",
-                                        DEFAULTS["liq_mg_skip_lot_pct"]) or 0)
-        except (TypeError, ValueError):
-            lot_pct = 50.0
-        lot_pct = max(0.0, min(100.0, lot_pct))
+            tail = eval_tail_filter(symbol)
+        except Exception as e:
+            log.warning(f"liq: {symbol} фильтр хвоста на убыточной свече: {e}")
+            tail = {"enabled": False, "blocked": False,
+                    "why": f"фильтр недоступен ({e})", "tail_sec": 0}
 
-        state = _load_state()
-        state.setdefault("mg_pending", {})[symbol] = {
-            "series": next_series,
-            "outcome": carried_outcome,
-            "max_skip": max_skip,
-            "lot_pct": lot_pct,
-            "skips_used": 0,
-            "checked_window": 0,
-            "created_ts": time.time(),
-            "tf": tf,
-            "cid": cid,
-        }
-        _save_state(state)
+        if tail.get("enabled") and tail.get("blocked"):
+            try:
+                max_skip = int(float(get_setting("liq_mg_skip_windows",
+                                                 DEFAULTS["liq_mg_skip_windows"]) or 0))
+            except (TypeError, ValueError):
+                max_skip = 2
+            max_skip = max(0, min(5, max_skip))
+            try:
+                lot_pct = float(get_setting("liq_mg_skip_lot_pct",
+                                            DEFAULTS["liq_mg_skip_lot_pct"]) or 0)
+            except (TypeError, ValueError):
+                lot_pct = 50.0
+            lot_pct = max(0.0, min(100.0, lot_pct))
 
-        try:
-            nxt_start, _nxt_end = _window_bounds(tf, settle_ts, offset_windows=1)
-            nxt_str = datetime.fromtimestamp(nxt_start, tz=timezone.utc).strftime("%H:%M:%S UTC")
-            await _send(
-                context, cid,
-                f"👀 *Жду подтверждения* `{symbol}` {carried_outcome}\n"
-                f"Шаг {next_series} войдёт в окно *{nxt_str}*, только если его свеча "
-                f"идёт в нашу сторону или случится микро-каскад в нашу пользу.\n"
-                f"Без подтверждения пропущу до *{max_skip}* окон, затем лот "
-                f"*{lot_pct:g}%* от расчётного (0% = серия останавливается).",
-                parse_mode="Markdown",
-            )
-        except Exception:
-            pass
-        return
+            if max_skip <= 1:
+                # Лимит пропусков исчерпан: убыточное окно — первый блок
+                if lot_pct <= 0:
+                    state = _load_state()
+                    state.setdefault("series", {})[symbol] = 0
+                    state.setdefault("series_pnl", {}).pop(symbol, None)
+                    state.setdefault("mg_pending", {}).pop(symbol, None)
+                    _save_state(state)
+                    log.info(f"liq: 🛑 {symbol} убыточная свеча не прошла фильтр "
+                             f"хвоста, пропусков нет — серия остановлена: {tail['why']}")
+                    try:
+                        await _send(
+                            context, cid,
+                            f"🛑 *Мартингейл остановлен — фильтр хвоста* `{symbol}` {carried_outcome}\n"
+                            f"Убыточная свеча не прошла фильтр: {md_escape(tail['why'])}\n"
+                            f"Пропусков окон нет (лимит 0) — серия остановлена. "
+                            f"Жду новый каскад.",
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+                    return
+                next_stake = round(next_stake * lot_pct / 100.0, 2)
+                entry_note = (f"фильтр хвоста: убыточная свеча не прошла, "
+                              f"лимит пропусков исчерпан — лот {lot_pct:g}%")
+                log.info(f"liq: ⚠️ {symbol} убыточная свеча не прошла фильтр хвоста "
+                         f"({tail['why']}), лимит пропусков исчерпан — вход лотом "
+                         f"{next_stake}$ ({lot_pct:g}%)")
+                try:
+                    await _send(
+                        context, cid,
+                        f"⚠️ *Фильтр хвоста: лимит пропусков исчерпан* `{symbol}` {carried_outcome}\n"
+                        f"Убыточная свеча не прошла фильтр: {md_escape(tail['why'])}\n"
+                        f"Пропускать окна некуда — вхожу в следующее окно лотом "
+                        f"*{next_stake}$* ({lot_pct:g}% от расчётного).",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+            else:
+                # Убыточное окно заблокировано (первый пропуск) — ждём,
+                # пока фильтр хвоста пустит одно из следующих окон.
+                state = _load_state()
+                state.setdefault("mg_pending", {})[symbol] = {
+                    "series": next_series,
+                    "outcome": carried_outcome,
+                    "max_skip": max_skip,
+                    "lot_pct": lot_pct,
+                    "skips_used": 1,  # убыточное окно = первый блок
+                    "checked_window": 0,
+                    "created_ts": time.time(),
+                    "tf": tf,
+                    "cid": cid,
+                }
+                _save_state(state)
+                log.info(f"liq: 👀 {symbol} убыточная свеча не прошла фильтр хвоста "
+                         f"({tail['why']}) — окно после убытка пропускаю, жду "
+                         f"прохождения фильтра (1/{max_skip})")
+                try:
+                    await _send(
+                        context, cid,
+                        f"👀 *Убыточная свеча не прошла фильтр хвоста* `{symbol}` {carried_outcome}\n"
+                        f"{md_escape(tail['why'])}\n"
+                        f"Окно сразу после убытка пропускаю. Жду, когда фильтр "
+                        f"хвоста пустит одно из следующих окон (пропусков "
+                        f"*1/{max_skip}*); после лимита — лот *{lot_pct:g}%* "
+                        f"от расчётного (0% = серия останавливается).",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+                return
+        else:
+            # Хвост прошёл (или фильтр выключен) — входим в следующее окно
+            # СРАЗУ, не пропуская шагов.
+            entry_note = f"фильтр хвоста: убыточная свеча прошла ({tail['why']})"
+            log.info(f"liq: ✅ {symbol} убыточная свеча прошла фильтр хвоста "
+                     f"({tail['why']}) — вхожу в следующее окно без пропусков")
+            try:
+                await _send(
+                    context, cid,
+                    f"✅ *Убыточная свеча прошла фильтр хвоста* `{symbol}` {carried_outcome}\n"
+                    f"{md_escape(tail['why'])}\n"
+                    f"Вхожу в следующее окно без пропусков.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
 
     next_offset = pick_entry_window(tf, settle_ts)
     next_window_start, next_window_end = _window_bounds(tf, settle_ts, offset_windows=next_offset)
@@ -3951,7 +4310,8 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     try:
         await _enter_martingale_step(context, cid, c, state, symbol,
                                      next_stake, next_series, tf,
-                                     carried_outcome=carried_outcome)
+                                     carried_outcome=carried_outcome,
+                                     entry_note=entry_note)
     except Exception as e:
         log.exception(f"martingale step enter err: {e}")
         try:
