@@ -180,9 +180,10 @@ GATE_BASE = liq_api.GATE_BASE
 # Версия логики ликвидаций. Показывается в статус-экране, чтобы из
 # Telegram было видно, перезапущен ли бот с новым кодом. Обновлять при
 # каждом значимом изменении логики.
-STRATEGY_VERSION = ("27.08.2026 #4 — вердикт только после официального "
-                    "разрешения рынка, цены выходов из живого стакана, "
-                    "свеча из 60с TWAP, FAK-тейк 1-й ставки")
+STRATEGY_VERSION = ("28.08.2026 #5 — повторные попытки входа при тонком "
+                    "стакане (серия не сбрасывается), фильтр ликвидаций "
+                    "убыточной свечи; вердикт только после официального "
+                    "разрешения рынка, цены выходов из живого стакана")
 
 # ===================== ПАРАМЕТРЫ ПО УМОЛЧАНИЮ =====================
 DEFAULTS = {
@@ -311,6 +312,23 @@ DEFAULTS = {
     "liq_tail_pct": "50",
     "liq_tail_mode": "above",
 
+    # ===== ФИЛЬТР ЛИКВИДАЦИЙ УБЫТОЧНОЙ СВЕЧИ =====
+    # Работает по аналогии с хвостом, но сравнивает ОБЪЁМ ликвидаций
+    # УБЫТОЧНОГО окна с объёмом «сигнального» окна (того, по которому
+    # бот заходил в рынок):
+    #   режим "больше" (above) — ликвидаций в убыточном окне БОЛЬШЕ
+    #     liq_loss_liq_pct% от сигнального → входа нет (шторм продолжается);
+    #   режим "меньше" (below) — ликвидаций в убыточном окне МЕНЬШЕ
+    #     liq_loss_liq_pct% от сигнального → входа нет (движение выдохлось).
+    # Пример: сигнал на $500k, порог «больше 50%». Проиграли, в убыточном
+    # окне $260k ликвидаций (52% от $500k) — больше порога, входа нет;
+    # $240k (48%) — меньше порога, вход есть.
+    # Применяется при ре-входе после убытка (вместе с фильтром хвоста).
+    # 0 — фильтр выключен.
+    "liq_loss_liq_on": "0",
+    "liq_loss_liq_pct": "50",
+    "liq_loss_liq_mode": "above",
+
     # ===== ПАУЗА СИГНАЛОВ ПОСЛЕ ОТМЕНЫ ФИЛЬТРОМ =====
     # Когда вход по монете отменил фильтр (хвост/импульс/OI/CVD), тот же
     # самый каскад ликвидаций продолжает «светиться» в окне агрегации, и
@@ -325,6 +343,15 @@ DEFAULTS = {
     # Минимальная глубина стороны спроса (аск) в стакане, кратная ставке
     # (0 — выключено). Глубина считается в пределах 3¢ от лучшего аска.
     "liq_depth_mult": "2",
+    # Сколько всего попыток входа делать, если стакан оказался тонким
+    # (спред/глубина не прошли фильтр). Стакан может быть плохим «в
+    # моменте» и прийти в норму через пару секунд — поэтому между
+    # попытками ждём liq_exec_retry_sec секунд. 1 — одна попытка (старое
+    # поведение). Попытки прекращаются досрочно, если окно входа
+    # закрывается.
+    "liq_exec_retries": "3",
+    # Пауза между попытками входа при тонком стакане, сек.
+    "liq_exec_retry_sec": "5",
     # Максимальная цена входа, ¢ (0 — выключено). Выше — payoff слишком
     # плохой для контр-трейда, сигнал/шаг пропускается.
     "liq_max_entry_cents": "60",
@@ -950,6 +977,100 @@ def eval_tail_filter(symbol: str, now: float | None = None) -> dict:
     return res
 
 
+def window_liq_usd(symbol: str, win_start: float, win_end: float) -> float:
+    """Суммарный объём ликвидаций ($) в окне [win_start, win_end).
+
+    Считается по буферу событий (600с). Используется фильтром ликвидаций
+    убыточной свечи и для запоминания «сигнального» объёма при входе.
+    """
+    total = 0.0
+    for e in _events_buffer.get(symbol, []):
+        t = float(e.get("time", 0) or 0)
+        if win_start <= t < win_end:
+            total += float(e.get("usd_value", 0) or 0)
+    return round(total, 2)
+
+
+def get_loss_liq_filter_cfg() -> tuple[bool, float, str]:
+    """Настройки фильтра ликвидаций убыточной свечи: (вкл, порог %, режим)."""
+    on = str(get_setting("liq_loss_liq_on",
+                         DEFAULTS["liq_loss_liq_on"]) or "0").strip() == "1"
+    try:
+        pct = float(get_setting("liq_loss_liq_pct",
+                                DEFAULTS["liq_loss_liq_pct"]) or 0)
+    except (TypeError, ValueError):
+        pct = 50.0
+    pct = max(0.0, min(1000.0, pct))
+    mode = str(get_setting("liq_loss_liq_mode",
+                           DEFAULTS["liq_loss_liq_mode"])
+               or "above").strip().lower()
+    if mode not in ("above", "below"):
+        mode = "above"
+    return on, pct, mode
+
+
+def eval_loss_liq_filter(symbol: str, ref_liq_usd, loss_window_start: float,
+                         loss_window_end: float) -> dict:
+    """Фильтр ликвидаций убыточной свечи (по аналогии с фильтром хвоста).
+
+    Сравнивает ОБЪЁМ ликвидаций в УБЫТОЧНОМ окне с объёмом «сигнального»
+    окна (того, по которому бот заходил в рынок — он запоминается в
+    позиции при входе, поле ref_liq_usd):
+
+      режим "больше" (above) — ликвидаций в убыточном окне БОЛЬШЕ
+        N% от сигнального → блок (давление ликвидаций сохраняется,
+        движение может продолжиться против нас);
+      режим "меньше" (below) — ликвидаций в убыточном окне МЕНЬШЕ
+        N% от сигнального → блок (поток выдохся, продолжения не будет).
+
+    Пример (порог «больше 50%»): сигнал на $500k → убыточное окно $260k
+    (52%) — больше порога, входа нет; $240k (48%) — меньше, вход есть.
+
+    Возвращает: enabled, blocked, why, share_pct, loss_usd, ref_usd,
+    pct, mode.
+    """
+    on, pct, mode = get_loss_liq_filter_cfg()
+    loss_usd = window_liq_usd(symbol, loss_window_start, loss_window_end)
+    try:
+        ref = float(ref_liq_usd or 0)
+    except (TypeError, ValueError):
+        ref = 0.0
+    res = {
+        "enabled": on,
+        "blocked": False,
+        "why": "",
+        "share_pct": 0.0,
+        "loss_usd": loss_usd,
+        "ref_usd": ref,
+        "pct": pct,
+        "mode": mode,
+    }
+    if not on:
+        res["why"] = "фильтр убыточной свечи выключен"
+        return res
+    if ref <= 0:
+        res["why"] = ("нет объёма сигнального окна для сравнения — "
+                      "фильтр пропущен")
+        return res
+    share = loss_usd / ref * 100.0
+    res["share_pct"] = share
+    nums = (f"ликвидации убыточного окна ${loss_usd:,.0f} = {share:.0f}% "
+            f"от сигнального окна (${ref:,.0f})")
+    mode_txt = "больше" if mode == "above" else "меньше"
+    if mode == "above" and share > pct:
+        res["blocked"] = True
+        res["why"] = (f"{nums} — больше порога {pct:g}%: давление ликвидаций "
+                      f"сохраняется, движение может продолжиться")
+    elif mode == "below" and share < pct:
+        res["blocked"] = True
+        res["why"] = (f"{nums} — меньше порога {pct:g}%: поток ликвидаций "
+                      f"выдохся, продолжения ждать не стоит")
+    else:
+        res["why"] = (f"{nums} — условие блокировки "
+                      f"({mode_txt} {pct:g}%) не сработало")
+    return res
+
+
 def get_signal_cooldown_sec() -> int:
     """Сколько секунд после отмены входа фильтром не принимать сигналы
     по этой монете. 0 — пауза выключена."""
@@ -1050,6 +1171,55 @@ def check_execution(token_id: str, stake_usd: float) -> tuple[bool, list[str], d
 
     detail = {"spread_cents": round(spread_cents, 1), "ask_depth_usd": round(depth_usd, 2)}
     return (not reasons), reasons, detail
+
+
+async def check_execution_retrying(token_id: str, stake_usd: float,
+                                   deadline: float | None = None
+                                   ) -> tuple[bool, list[str], dict, int]:
+    """Фильтр исполнения (спред/глубина) с несколькими попытками.
+
+    Стакан может быть тонким «в моменте» и прийти в норму уже на
+    следующем тике — поэтому при провале делаем ещё
+    liq_exec_retries−1 попыток с паузой liq_exec_retry_sec секунд.
+
+    deadline — конец окна входа: если до него осталось меньше 15 секунд,
+    попытки прекращаем, чтобы не отправлять ордер в закрывающееся окно.
+
+    Возвращает (прошёл ли, причины последней неудачи, детали,
+    сколько попыток сделано).
+    """
+    try:
+        retries = int(float(get_setting("liq_exec_retries",
+                                        DEFAULTS["liq_exec_retries"]) or 1))
+    except (TypeError, ValueError):
+        retries = 3
+    retries = max(1, min(10, retries))
+    try:
+        pause = float(get_setting("liq_exec_retry_sec",
+                                  DEFAULTS["liq_exec_retry_sec"]) or 5)
+    except (TypeError, ValueError):
+        pause = 5.0
+    pause = max(1.0, min(60.0, pause))
+
+    reasons: list[str] = []
+    detail: dict = {}
+    attempts = 0
+    for attempt in range(1, retries + 1):
+        attempts = attempt
+        ok, reasons, detail = check_execution(token_id, stake_usd)
+        if ok:
+            if attempt > 1:
+                log.info(f"liq: стакан пришёл в норму с попытки {attempt}")
+            return True, reasons, detail, attempt
+        if attempt >= retries:
+            break
+        if deadline is not None and time.time() + pause > deadline - 15:
+            log.info("liq: окно входа закрывается — прекращаю попытки стакана")
+            break
+        log.info(f"liq: тонкий стакан (попытка {attempt}/{retries}): "
+                 f"{reasons} — повтор через {pause:g}с")
+        await asyncio.sleep(pause)
+    return False, reasons, detail, attempts
 
 
 def any_active_position() -> bool:
@@ -1388,6 +1558,12 @@ def _filters_status_line() -> str:
         bits.append(f"хвост {tail_sec}с/{tail_pct:g}% ({mode_txt})")
     else:
         bits.append("хвост ⛔")
+    loss_on, loss_pct, loss_mode = get_loss_liq_filter_cfg()
+    if loss_on:
+        loss_txt = "больше" if loss_mode == "above" else "меньше"
+        bits.append(f"убыт.свеча {loss_pct:g}% ({loss_txt})")
+    else:
+        bits.append("убыт.свеча ⛔")
     bits.append(f"импульс {streak} св./{_f('liq_filter_impulse_pct', 0):.2f}%"
                 if streak > 0 else "импульс ⛔")
     bits.append(f"OI +{oi_lim:.2f}%" if oi_lim > 0 else "OI ⛔")
@@ -1402,6 +1578,40 @@ def _filters_status_line() -> str:
     else:
         bits.append("CVD ⛔")
     return "🛡 Фильтры памп/дампа: " + " | ".join(bits)
+
+
+def _execution_status_line() -> str:
+    """Строка статуса: фильтры исполнения (стакан) и повторные попытки."""
+    try:
+        spread_max = float(get_setting("liq_spread_max_cents",
+                                       DEFAULTS["liq_spread_max_cents"]) or 0)
+    except (TypeError, ValueError):
+        spread_max = 3.0
+    try:
+        depth_mult = float(get_setting("liq_depth_mult",
+                                       DEFAULTS["liq_depth_mult"]) or 0)
+    except (TypeError, ValueError):
+        depth_mult = 2.0
+    try:
+        retries = int(float(get_setting("liq_exec_retries",
+                                        DEFAULTS["liq_exec_retries"]) or 1))
+    except (TypeError, ValueError):
+        retries = 3
+    try:
+        pause = int(float(get_setting("liq_exec_retry_sec",
+                                      DEFAULTS["liq_exec_retry_sec"]) or 5))
+    except (TypeError, ValueError):
+        pause = 5
+    if spread_max <= 0 and depth_mult <= 0:
+        return "🪞 Стакан: фильтры исполнения выключены"
+    bits = []
+    if spread_max > 0:
+        bits.append(f"спред ≤{spread_max:g}¢")
+    if depth_mult > 0:
+        bits.append(f"глубина ×{depth_mult:g}")
+    bits.append(f"попыток {max(1, min(10, retries))}×{max(1, min(60, pause))}с "
+                f"(серия при неудаче сохраняется)")
+    return "🪞 Стакан: " + " | ".join(bits)
 
 
 def _candle_source_line() -> str:
@@ -1494,6 +1704,7 @@ def get_status_text() -> str:
     lines.append(f"🕯 Сигнальная свеча: *{_sb}*")
     lines.append(f"⏳ Перепроверка её направления: за *{get_entry_confirm_sec()}с* до закрытия окна")
     lines.append(_filters_status_line())
+    lines.append(_execution_status_line())
     lines.append(_funnel_line())
     _lf = _last_filters_line()
     if _lf:
@@ -2492,7 +2703,8 @@ async def _mg_pending_check_one(context, session, c, symbol: str, req: dict, now
         await _enter_martingale_step(context, cid, c, state, symbol,
                                      stake, series, tf,
                                      carried_outcome=outcome,
-                                     entry_note=f"фильтр хвоста: {why}")
+                                     entry_note=f"фильтр хвоста: {why}",
+                                     ref_liq_usd=window_liq_usd(symbol, cur_start, cur_end))
         return
 
     # Фильтр хвоста окно не пропустил
@@ -2541,7 +2753,8 @@ async def _mg_pending_check_one(context, session, c, symbol: str, req: dict, now
                                      stake, series, tf,
                                      carried_outcome=outcome,
                                      entry_note=f"вход после {max_skip} окон без "
-                                                f"фильтра хвоста, лот {lot_pct:g}%")
+                                                f"фильтра хвоста, лот {lot_pct:g}%",
+                                     ref_liq_usd=window_liq_usd(symbol, cur_start, cur_end))
     else:
         state["series"][symbol] = 0
         state.setdefault("series_pnl", {}).pop(symbol, None)
@@ -3152,21 +3365,29 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
     demo = get_setting("demo_mode", "0") == "1"
     is_demo_flag = 1 if demo else 0
 
-    # === Фильтр исполнения: спред и глубина стакана ===
+    # === Фильтр исполнения: спред и глубина стакана (с повторными попытками) ===
+    # Стакан бывает тонким «в моменте» и восстанавливается за секунды —
+    # поэтому делаем до liq_exec_retries попыток с паузой между ними.
     if not demo:
-        exec_ok, exec_reasons, _exec_detail = check_execution(token_id, stake_usd_final)
+        exec_ok, exec_reasons, _exec_detail, exec_attempts = \
+            await check_execution_retrying(token_id, stake_usd_final,
+                                           deadline=win_end)
         if not exec_ok:
-            log.warning(f"liq_strategy: {symbol} вход отменён — стакан: {exec_reasons}")
+            log.warning(f"liq_strategy: {symbol} вход отменён — стакан "
+                        f"({exec_attempts} попыток): {exec_reasons}")
             set_setting(
                 "liq_last_scan",
                 f"[{symbol}] вход отменён: {exec_reasons[0][:90]}",
             )
+            # Пауза сигналов: тот же каскад ещё «светится» в окне агрегации,
+            # без паузы бот тут же пошёл бы на новый круг попыток.
+            _set_signal_cooldown(symbol)
             await _send(
                 context, cid,
                 f"🚫 *Вход пропущен — тонкий стакан* `{symbol}` {outcome}\n"
                 + "\n".join(f"• {md_escape(r)}" for r in exec_reasons)
-                + "\n_Рыночный ордер в таком стакане даёт плохую среднюю цену "
-                  "и слиппедж. Ждём следующий сигнал._",
+                + f"\n_Сделано попыток: {exec_attempts}. Рыночный ордер в таком "
+                  "стакане даёт плохую среднюю цену и слиппедж. Ждём следующий сигнал._",
                 parse_mode="Markdown",
             )
             return
@@ -3258,6 +3479,13 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
 
     window_end = win_end
     start_next = win_start
+    # «Сигнальное» окно — то, в котором прошёл каскад (окно сразу ПЕРЕД
+    # окном входа). Его объём ликвидаций запоминаем: если этот шаг
+    # проиграет, фильтр убыточной свечи сравнит с ним ликвидации
+    # убыточного окна.
+    ref_liq_usd = window_liq_usd(symbol, win_start - dur, win_start)
+    if ref_liq_usd <= 0:
+        ref_liq_usd = float((agg or {}).get("total_usd") or 0)
     # Сохраняем реальное имя события с Polymarket, чтобы статистика потом
     # корректно показывала «Bitcoin Up or Down» / «Ethereum Up or Down» и т.д.
     raw_q = m.get("question") if isinstance(m, dict) else None
@@ -3283,6 +3511,7 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
         "open_ts": now,
         "oi_snapshot": oi_data or {},
         "market_question_raw": raw_q or "",
+        "ref_liq_usd": ref_liq_usd,
     }
     # Доп. защита: перечитываем состояние прямо перед записью — между
     # проверкой и этим моментом были сетевые вызовы, за которые другой
@@ -4411,6 +4640,16 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     tf = c["liq_timeframe"]
     entry_note = ""
 
+    # Объём ликвидаций в УБЫТОЧНОМ окне: это и есть «сигнальное окно»
+    # для СЛЕДУЮЩЕГО шага серии (фильтр убыточной свечи сравнивает
+    # ликвидации убыточного окна с окном, по которому заходили).
+    loss_window_usd = 0.0
+    try:
+        loss_window_usd = window_liq_usd(symbol, pos.get("window_start") or 0,
+                                         pos.get("window_end") or 0)
+    except Exception as e:
+        log.debug(f"liq: {symbol} loss_window_usd err: {e}")
+
     if get_mg_entry_mode() == "signal":
         # === Режим signal: повторный вход через ФИЛЬТР ХВОСТА ЛИКВИДАЦИЙ ===
         # Убыточная свеча оценивается по тому же принципу, что и перед
@@ -4424,14 +4663,36 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
         #     заблокированным. После liq_mg_skip_windows заблокированных
         #     окон — вход лотом liq_mg_skip_lot_pct% или остановка серии
         #     (при 0%).
+        # Плюс ФИЛЬТР ЛИКВИДАЦИЙ УБЫТОЧНОЙ СВЕЧИ: объём ликвидаций
+        # убыточного окна сравнивается с «сигнальным» окном входа
+        # (режим больше/меньше N%) — см. eval_loss_liq_filter.
         try:
             tail = eval_tail_filter(symbol)
         except Exception as e:
             log.warning(f"liq: {symbol} фильтр хвоста на убыточной свече: {e}")
             tail = {"enabled": False, "blocked": False,
                     "why": f"фильтр недоступен ({e})", "tail_sec": 0}
+        try:
+            loss_liq = eval_loss_liq_filter(symbol, pos.get("ref_liq_usd"),
+                                            pos.get("window_start") or 0,
+                                            pos.get("window_end") or 0)
+        except Exception as e:
+            log.warning(f"liq: {symbol} фильтр убыточной свечи: {e}")
+            loss_liq = {"enabled": False, "blocked": False,
+                        "why": f"фильтр недоступен ({e})"}
 
-        if tail.get("enabled") and tail.get("blocked"):
+        tail_blocked = bool(tail.get("enabled") and tail.get("blocked"))
+        loss_liq_blocked = bool(loss_liq.get("enabled") and loss_liq.get("blocked"))
+        if loss_liq.get("enabled"):
+            log.info(f"liq: {symbol} фильтр убыточной свечи: {loss_liq.get('why')}")
+        if tail_blocked or loss_liq_blocked:
+            block_parts = []
+            if tail_blocked:
+                block_parts.append(f"хвост: {tail.get('why')}")
+            if loss_liq_blocked:
+                block_parts.append(f"ликвидации убыточной свечи: {loss_liq.get('why')}")
+            tail = dict(tail)
+            tail["why"] = " | ".join(block_parts)
             try:
                 max_skip = int(float(get_setting("liq_mg_skip_windows",
                                                  DEFAULTS["liq_mg_skip_windows"]) or 0))
@@ -4458,7 +4719,7 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
                     try:
                         await _send(
                             context, cid,
-                            f"🛑 *Мартингейл остановлен — фильтр хвоста* `{symbol}` {carried_outcome}\n"
+                            f"🛑 *Мартингейл остановлен — фильтр убыточной свечи* `{symbol}` {carried_outcome}\n"
                             f"Убыточная свеча не прошла фильтр: {md_escape(tail['why'])}\n"
                             f"Пропусков окон нет (лимит 0) — серия остановлена. "
                             f"Жду новый каскад.",
@@ -4468,7 +4729,7 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
                         pass
                     return
                 next_stake = round(next_stake * lot_pct / 100.0, 2)
-                entry_note = (f"фильтр хвоста: убыточная свеча не прошла, "
+                entry_note = (f"фильтр убыточной свечи: не прошла, "
                               f"лимит пропусков исчерпан — лот {lot_pct:g}%")
                 log.info(f"liq: ⚠️ {symbol} убыточная свеча не прошла фильтр хвоста "
                          f"({tail['why']}), лимит пропусков исчерпан — вход лотом "
@@ -4506,7 +4767,7 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
                 try:
                     await _send(
                         context, cid,
-                        f"👀 *Убыточная свеча не прошла фильтр хвоста* `{symbol}` {carried_outcome}\n"
+                        f"👀 *Убыточная свеча не прошла фильтр* `{symbol}` {carried_outcome}\n"
                         f"{md_escape(tail['why'])}\n"
                         f"Окно сразу после убытка пропускаю. Жду, когда фильтр "
                         f"хвоста пустит одно из следующих окон (пропусков "
@@ -4520,13 +4781,13 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
         else:
             # Хвост прошёл (или фильтр выключен) — входим в следующее окно
             # СРАЗУ, не пропуская шагов.
-            entry_note = f"фильтр хвоста: убыточная свеча прошла ({tail['why']})"
+            entry_note = f"фильтры убыточной свечи: прошла ({tail['why']})"
             log.info(f"liq: ✅ {symbol} убыточная свеча прошла фильтр хвоста "
                      f"({tail['why']}) — вхожу в следующее окно без пропусков")
             try:
                 await _send(
                     context, cid,
-                    f"✅ *Убыточная свеча прошла фильтр хвоста* `{symbol}` {carried_outcome}\n"
+                    f"✅ *Убыточная свеча прошла фильтры убыточной свечи* `{symbol}` {carried_outcome}\n"
                     f"{md_escape(tail['why'])}\n"
                     f"Вхожу в следующее окно без пропусков.",
                     parse_mode="Markdown",
@@ -4547,7 +4808,8 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
         await _enter_martingale_step(context, cid, c, state, symbol,
                                      next_stake, next_series, tf,
                                      carried_outcome=carried_outcome,
-                                     entry_note=entry_note)
+                                     entry_note=entry_note,
+                                     ref_liq_usd=loss_window_usd)
     except Exception as e:
         log.exception(f"martingale step enter err: {e}")
         try:
@@ -4561,7 +4823,8 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
 
 async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, series, tf,
                                  carried_outcome: str | None = None,
-                                 entry_note: str = ""):
+                                 entry_note: str = "",
+                                 ref_liq_usd: float | None = None):
     """Вход в следующее окно с увеличенной ставкой. Вызывается
     планировщиком мартингейла: в режиме timer — сразу после проигранного
     шага, в режиме signal — после подтверждения нового окна.
@@ -4576,6 +4839,11 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
 
     entry_note: пояснение, ПОЧЕМУ вошли именно сейчас (подтверждение
     свечи/каскада, вход после пропусков) — попадает в сообщение.
+
+    ref_liq_usd: объём ликвидаций в окне-триггере этого входа (для шага
+    после убытка — убыточное окно, после пропусков — окно, прошедшее
+    фильтр). Нужен фильтру ликвидаций убыточной свечи на случай, если
+    этот шаг проиграет.
     """
     import polymarket_trading as pt
 
@@ -4709,20 +4977,35 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
     demo = get_setting("demo_mode", "0") == "1"
     is_demo_flag = 1 if demo else 0
 
-    # === Фильтр исполнения: спред и глубина стакана ===
+    # === Фильтр исполнения: спред и глубина стакана (с повторными попытками) ===
     if not demo:
-        exec_ok, exec_reasons, _exec_detail = check_execution(token_id, stake_usd_final)
+        exec_ok, exec_reasons, _exec_detail, exec_attempts = \
+            await check_execution_retrying(token_id, stake_usd_final,
+                                           deadline=window_end)
         if not exec_ok:
-            log.warning(f"liq: мартингейл {symbol} шаг {series} — стакан: {exec_reasons}")
-            state["series"][symbol] = 0
-            state.setdefault("series_pnl", {}).pop(symbol, None)
-            _save_state(state)
+            # ВАЖНО: серию НЕ останавливаем и НЕ сбрасываем. Стакан был
+            # тонким в моменте — вход просто не получился. Долг серии и
+            # шаг сохраняются: следующий сигнал по этой монете зайдёт тем
+            # же лотом, который должен был войти сейчас.
+            debt = abs(get_series_pnl(state, symbol))
+            log.warning(f"liq: мартингейл {symbol} шаг {series} — стакан не пустил "
+                        f"({exec_attempts} попыток): {exec_reasons}. Серия сохранена, "
+                        f"ждём следующий сигнал с лотом ${stake_usd:.2f}")
+            set_setting(
+                "liq_last_scan",
+                f"[{symbol}] шаг {series} не вошёл (стакан), серия ждёт сигнал",
+            )
+            # Пауза сигналов: тот же каскад ещё «светится» в окне агрегации,
+            # без паузы бот тут же пошёл бы на новый круг попыток.
+            _set_signal_cooldown(symbol)
             await _send(
                 context, cid,
-                f"🛑 *Мартингейл остановлен — тонкий стакан* `{symbol}` (шаг {series})\n"
+                f"🛑 *Вход не получился — тонкий стакан* `{symbol}` (шаг {series})\n"
                 + "\n".join(f"• {md_escape(r)}" for r in exec_reasons)
-                + "\n_Рыночный ордер в таком стакане даёт плохую среднюю цену "
-                  "и слиппедж. Ждём новый сигнал._",
+                + f"\n_Сделано попыток: {exec_attempts}. Рыночный ордер в таком "
+                  "стакане даёт плохую среднюю цену и слиппедж._\n"
+                  f"♻️ *Серия НЕ остановлена*: жду следующий сигнал по монете — "
+                  f"вход тем же лотом *${stake_usd:.2f}* (долг серии ${debt:.2f}).",
                 parse_mode="Markdown",
             )
             return
@@ -4822,6 +5105,9 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
         "agg_snapshot": agg, "candle": candle, "symbol": symbol,
         "open_ts": now, "oi_snapshot": {},
         "market_question_raw": raw_q or "",
+        # Объём ликвидаций окна-триггера: нужен фильтру убыточной свечи,
+        # если этот шаг проиграет.
+        "ref_liq_usd": float(ref_liq_usd or 0),
     }
     state = _load_state()
     if symbol in (state.get("positions") or {}):

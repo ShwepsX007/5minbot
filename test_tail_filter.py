@@ -21,6 +21,12 @@
      (раздел 11, кейс SOL 20:30 27.08.2026).
   9. Цены выходов (аварийный выход, тейки) берутся из живого стакана
      CLOB, а не из отстающей гаммы (раздел 12, кейс XRP 21:10).
+ 10. Тонкий стакан: повторные попытки входа; при неудаче серия
+     мартингейла НЕ сбрасывается — следующий сигнал заходит тем же
+     лотом (раздел 13).
+ 11. Фильтр ликвидаций убыточной свечи: объём ликвидаций убыточного
+     окна сравнивается с «сигнальным» окном (больше/меньше N%)
+     (раздел 14).
 """
 import asyncio
 import os
@@ -248,8 +254,10 @@ async def main():
     real_time_mod = ls.time
 
     async def fake_enter(context, cid, c_, state_, symbol_, stake, series_, tf_,
-                         carried_outcome=None, entry_note=""):
-        entered.append({"series": series_, "stake": stake, "note": entry_note})
+                         carried_outcome=None, entry_note="", ref_liq_usd=None,
+                         **_kw):
+        entered.append({"series": series_, "stake": stake, "note": entry_note,
+                        "ref_liq_usd": ref_liq_usd})
 
     real_enter = ls._enter_martingale_step
     ls._enter_martingale_step = fake_enter
@@ -729,6 +737,231 @@ async def main():
                     delattr(pt_stub, name)
                 except AttributeError:
                     pass
+
+    print("\n=== 13. Тонкий стакан: повторные попытки и сохранение серии ===")
+    check("дефолт попыток входа — 3", ls.DEFAULTS["liq_exec_retries"] == "3")
+    check("дефолт паузы между попытками — 5с",
+          ls.DEFAULTS["liq_exec_retry_sec"] == "5")
+
+    set_cfg(liq_exec_retries="3", liq_exec_retry_sec="1",
+            liq_spread_max_cents="3", liq_depth_mult="2")
+
+    def thin_book(tid):
+        return {"best_bid": 0.44, "best_ask": 0.52,
+                "bids": [(0.44, 10)], "asks": [(0.52, 10)]}
+
+    def ok_book(tid):
+        return {"best_bid": 0.48, "best_ask": 0.50,
+                "bids": [(0.48, 10)], "asks": [(0.50, 10)]}
+
+    pt_stub.get_book = thin_book
+    ok, reasons, _detail, attempts = await ls.check_execution_retrying(
+        "tok", 1.0)
+    check("стакан всё время тонкий → все 3 попытки, вход отменён",
+          ok is False and attempts == 3 and len(reasons) > 0,
+          f"ok={ok} attempts={attempts} reasons={reasons}")
+
+    books_seq = [thin_book(None), thin_book(None), ok_book(None)]
+    pt_stub.get_book = lambda tid: books_seq.pop(0)
+    ok, _r, _d, attempts = await ls.check_execution_retrying("tok", 1.0)
+    check("стакан восстановился → прошли с 3-й попытки",
+          ok is True and attempts == 3, f"ok={ok} attempts={attempts}")
+
+    pt_stub.get_book = thin_book
+    ok, _r, _d, attempts = await ls.check_execution_retrying(
+        "tok", 1.0, deadline=time.time() + 2)
+    check("окно входа закрывается → попытки прекращены досрочно",
+          ok is False and attempts == 1, f"ok={ok} attempts={attempts}")
+
+    # Интеграция: шаг мартингейла не смог войти из-за стакана → серия
+    # НЕ сбрасывается, следующий сигнал зайдёт тем же лотом.
+    pt_stub.get_event_markets = lambda slug: {"markets": [{
+        "question": "Btc", "token_yes": "tok_up", "token_no": "tok_dn",
+        "price_yes": 51, "price_no": 49}]}
+    pt_stub.get_market_info = lambda tid: {
+        "neg_risk": False, "accepting_orders": True, "closed": False,
+        "min_shares": 5.0, "min_size": 5.0, "tick_size": 0.01}
+    set_cfg(liq_exec_retries="2", liq_exec_retry_sec="1", demo_mode="0")
+    st_seed = ls._load_state()
+    st_seed.setdefault("series", {})[sym] = 2
+    st_seed.setdefault("series_pnl", {})[sym] = -2.0
+    st_seed["positions"] = {}
+    st_seed.setdefault("mg_pending", {}).pop(sym, None)
+    ls._save_state(st_seed)
+
+    real_send2 = ls._send
+    captured_msg = {}
+
+    async def fake_send2(context, cid, text, **kw):
+        captured_msg["msg"] = text
+
+    ls._send = fake_send2
+    try:
+        await ls._enter_martingale_step(None, 1, c_full, ls._load_state(),
+                                        sym, 2.0, 2, "5m",
+                                        carried_outcome="UP")
+    finally:
+        ls._send = real_send2
+    st_after = ls._load_state()
+    check("тонкий стакан → серия НЕ сброшена (шаг 2)",
+          int((st_after.get("series") or {}).get(sym, 0)) == 2,
+          str(st_after.get("series")))
+    check("тонкий стакан → долг серии сохранён (-2.0$)",
+          abs(float((st_after.get("series_pnl") or {}).get(sym, 0))
+              + 2.0) < 1e-9,
+          str(st_after.get("series_pnl")))
+    check("сообщение: серия не остановлена, вход тем же лотом",
+          "Серия НЕ остановлена" in captured_msg.get("msg", ""),
+          captured_msg.get("msg", "")[:220])
+    check("позиция не открыта",
+          sym not in (st_after.get("positions") or {}))
+
+    # Возврат демо-режима и очистка стакана-заглушки.
+    set_cfg(demo_mode="1")
+    try:
+        delattr(pt_stub, "get_book")
+    except AttributeError:
+        pass
+    st_clean = ls._load_state()
+    st_clean.setdefault("series", {})[sym] = 0
+    st_clean.setdefault("series_pnl", {}).pop(sym, None)
+    st_clean.setdefault("cooldowns", {}).pop(sym, None)
+    ls._save_state(st_clean)
+
+    print("\n=== 14. Фильтр ликвидаций убыточной свечи ===")
+    check("дефолты фильтра: выкл / 50% / больше",
+          ls.DEFAULTS["liq_loss_liq_on"] == "0"
+          and ls.DEFAULTS["liq_loss_liq_pct"] == "50"
+          and ls.DEFAULTS["liq_loss_liq_mode"] == "above")
+
+    # Подготовка: убыточное окно [ws, we) с ликвидациями 260k.
+    pos14 = fresh_pos(sym)
+    ws, we = pos14["window_start"], pos14["window_end"]
+    loss_events = [{"time": ws + 10, "usd_value": 160_000},
+                   {"time": ws + 20, "usd_value": 100_000}]
+    ls._events_buffer[sym] = loss_events + [
+        {"time": ws - 100, "usd_value": 999_999},   # ДО окна — не в счёт
+        {"time": we + 100, "usd_value": 999_999},   # ПОСЛЕ окна — не в счёт
+    ]
+    check("события вне окна не учитываются",
+          abs(ls.window_liq_usd(sym, ws, we) - 260_000) < 1e-9,
+          str(ls.window_liq_usd(sym, ws, we)))
+
+    r = ls.eval_loss_liq_filter(sym, 500_000, ws, we)
+    check("фильтр выключен → не блокирует", r["blocked"] is False)
+
+    set_cfg(liq_loss_liq_on="1", liq_loss_liq_pct="50",
+            liq_loss_liq_mode="above", liq_tail_sec="0")
+
+    r = ls.eval_loss_liq_filter(sym, 500_000, ws, we)
+    check("режим «больше 50%»: 260k = 52% > 50% → входа НЕТ",
+          r["blocked"] is True and abs(r["share_pct"] - 52.0) < 0.1,
+          str(r))
+    ls._events_buffer[sym] = [{"time": ws + 10, "usd_value": 240_000}]
+    r = ls.eval_loss_liq_filter(sym, 500_000, ws, we)
+    check("режим «больше 50%»: 240k = 48% < 50% → вход ЕСТЬ",
+          r["blocked"] is False, str(r))
+    ls._events_buffer[sym] = [{"time": ws + 10, "usd_value": 250_000}]
+    r = ls.eval_loss_liq_filter(sym, 500_000, ws, we)
+    check("ровно 50% → не блок (строгое неравенство)",
+          r["blocked"] is False, str(r))
+
+    set_cfg(liq_loss_liq_mode="below")
+    ls._events_buffer[sym] = [{"time": ws + 10, "usd_value": 260_000}]
+    r = ls.eval_loss_liq_filter(sym, 500_000, ws, we)
+    check("режим «меньше 50%»: 260k > 50% → вход ЕСТЬ",
+          r["blocked"] is False, str(r))
+    ls._events_buffer[sym] = [{"time": ws + 10, "usd_value": 240_000}]
+    r = ls.eval_loss_liq_filter(sym, 500_000, ws, we)
+    check("режим «меньше 50%»: 240k < 50% → входа НЕТ",
+          r["blocked"] is True, str(r))
+
+    r = ls.eval_loss_liq_filter(sym, 0, ws, we)
+    check("нет объёма сигнального окна → фильтр пропускается",
+          r["blocked"] is False and "нет объёма" in r["why"], str(r))
+
+    # Интеграция через расчёт убыточного шага (хвост выключен, чтобы он
+    # не мешал): блок фильтра убыточной свечи = план ожидания окна.
+    async def settle_loss_pos(pos):
+        state = ls._load_state()
+        state["positions"] = {sym: pos}
+        state["series"] = {sym: 0}
+        state.setdefault("series_pnl", {}).pop(sym, None)
+        state.setdefault("mg_pending", {}).pop(sym, None)
+        ls._save_state(state)
+        await ls._settle_position(ctx, 1, ls.cfg(), state, sym, pos,
+                                  win=False, close_price=0, price_yes=5,
+                                  price_no=95,
+                                  market_question="Bitcoin Up or Down",
+                                  early_exit=True, settle_ts=time.time())
+
+    set_cfg(liq_loss_liq_mode="above", liq_mg_skip_windows="2",
+            liq_mg_skip_lot_pct="50")
+    real_enter14 = ls._enter_martingale_step
+    ls._enter_martingale_step = fake_enter
+    try:
+        entered.clear()
+        pos_block = fresh_pos(sym)
+        pos_block["ref_liq_usd"] = 500_000
+        ls._events_buffer[sym] = [{"time": ws + 10, "usd_value": 260_000}]
+        await settle_loss_pos(pos_block)
+        st = ls._load_state()
+        mg = (st.get("mg_pending") or {}).get(sym) or {}
+        check("интеграция: 52% > 50% → входа нет, план ожидания (1/2)",
+              len(entered) == 0 and mg.get("skips_used") == 1
+              and int((st.get("series") or {}).get(sym, 0)) == 1,
+              f"entered={entered} mg={mg}")
+
+        entered.clear()
+        pos_pass = fresh_pos(sym)
+        pos_pass["ref_liq_usd"] = 500_000
+        ls._events_buffer[sym] = [{"time": ws + 10, "usd_value": 240_000}]
+        await settle_loss_pos(pos_pass)
+        st = ls._load_state()
+        check("интеграция: 48% < 50% → сразу ре-вход",
+              len(entered) == 1 and entered[0]["series"] == 1, str(entered))
+        check("ре-вход запоминает убыточное окно как «сигнальное» (240k)",
+              entered and abs(float(entered[0].get("ref_liq_usd") or 0)
+                              - 240_000) < 1e-9,
+              str(entered))
+        entered.clear()
+
+        # Фильтр выключен — 52% не мешает входу.
+        set_cfg(liq_loss_liq_on="0")
+        ls._events_buffer[sym] = [{"time": ws + 10, "usd_value": 260_000}]
+        pos_off = fresh_pos(sym)
+        pos_off["ref_liq_usd"] = 500_000
+        await settle_loss_pos(pos_off)
+        check("фильтр выключен → 52% не блокирует ре-вход",
+              len(entered) == 1, str(entered))
+        entered.clear()
+    finally:
+        ls._enter_martingale_step = real_enter14
+    set_cfg(liq_tail_sec="50", liq_loss_liq_on="0")
+
+    keys = [k for k, _, _ in liq_menu.PARAMS]
+    check("параметры фильтра убыточной свечи в меню",
+          all(k in keys for k in ("liq_loss_liq_on", "liq_loss_liq_pct",
+                                  "liq_loss_liq_mode")), str(keys))
+    check("параметры попыток стакана в меню",
+          all(k in keys for k in ("liq_exec_retries", "liq_exec_retry_sec")),
+          str(keys))
+    ok, norm, err = liq_menu.validate_manual_input("liq_loss_liq_mode", "больше")
+    check("ручной ввод «больше» → above", ok and norm == "above", err)
+    ok, norm, err = liq_menu.validate_manual_input("liq_loss_liq_mode", "меньше")
+    check("ручной ввод «меньше» → below", ok and norm == "below", err)
+    ok, norm, err = liq_menu.validate_manual_input("liq_loss_liq_on", "вкл")
+    check("ручной ввод «вкл» → 1", ok and norm == "1", err)
+    ok, norm, err = liq_menu.validate_manual_input("liq_exec_retries", "3")
+    check("ручной ввод попыток 3", ok and norm == "3", err)
+    ok, norm, err = liq_menu.validate_manual_input("liq_exec_retries", "99")
+    check("попытки 99 > максимума 10 → ошибка", not ok)
+
+    fl = ls._filters_status_line()
+    check("фильтр убыточной свечи виден в статусе", "убыт.свеча" in fl, fl)
+    el = ls._execution_status_line()
+    check("попытки стакана видны в статусе",
+          "попыток" in el and "сохраняется" in el, el)
 
     print(f"\nИТОГ: {PASS} прошло, {FAIL} упало")
     return FAIL
