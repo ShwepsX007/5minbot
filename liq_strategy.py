@@ -180,7 +180,8 @@ GATE_BASE = liq_api.GATE_BASE
 # Версия логики ликвидаций. Показывается в статус-экране, чтобы из
 # Telegram было видно, перезапущен ли бот с новым кодом. Обновлять при
 # каждом значимом изменении логики.
-STRATEGY_VERSION = ("28.08.2026 #5 — повторные попытки входа при тонком "
+STRATEGY_VERSION = ("28.08.2026 #6 — динамический порог ликвидаций по "
+                    "объёму торгов; повторные попытки входа при тонком "
                     "стакане (серия не сбрасывается), фильтр ликвидаций "
                     "убыточной свечи; вердикт только после официального "
                     "разрешения рынка, цены выходов из живого стакана")
@@ -193,6 +194,22 @@ DEFAULTS = {
     "liq_timeframe":     "5m",
     "liq_window_sec":    "60",
     "liq_threshold_usd": "150000",
+
+    # ===== ДИНАМИЧЕСКИЙ ПОРОГ ЛИКВИДАЦИЙ ПО ОБЪЁМУ ТОРГОВ =====
+    # Бот берёт часовые объёмы торгов (USDT) за последние
+    # liq_dyn_thr_hours часов, находит минимум/максимум/среднее и
+    # ЛИНЕЙНО растягивает порог ликвидаций между liq_dyn_thr_min и
+    # liq_dyn_thr_max в зависимости от того, где объём ПОСЛЕДНЕГО часа
+    # находится внутри диапазона [мин, макс].
+    # Пример: за 24ч объёмы $10млрд–$100млрд, порог $100k–$1M; последний
+    # час $30млрд → (30−10)/(100−10)=22.2% → порог $100k+22.2%×$900k=
+    # $300k. Активный рынок → порог выше (меньше шума), тихий → ниже.
+    # 0 — выключено (используется статичный Порог каскада).
+    "liq_dyn_thr_on": "0",
+    "liq_dyn_thr_hours": "24",
+    "liq_dyn_thr_min": "100000",
+    "liq_dyn_thr_max": "1000000",
+
     "liq_check_interval": "5",
     "liq_min_size_usd":  "1000",
     "liq_base_stake":    "1",
@@ -1384,7 +1401,10 @@ def _save_last_liquidation(symbol: str, agg: dict, events: list, candle: str | N
         "by_exchange": agg.get("by_exchange", {}),
         "candle": candle,
         "window_sec": int(float(get_setting("liq_window_sec", "60"))),
-        "threshold": float(get_setting("liq_threshold_usd", "150000")),
+        # Тот порог, по которому реально оценивался каскад (может быть
+        # динамическим — по объёму торгов).
+        "threshold": float((agg or {}).get("_threshold_eff")
+                           or get_setting("liq_threshold_usd", "150000")),
         "oi_total": (oi_data or {}).get("total", 0),
         "oi_breakdown": oi_data or {},
     }
@@ -1678,7 +1698,10 @@ def get_status_text() -> str:
     entry_mode = get_entry_mode()
     entry_mode_pretty = "🚀 Рыночный (по лучшей цене)" if entry_mode == "market" else "📋 Лимитный (по цене из настроек)"
     lines.append(f"🎯 Тип входа: *{entry_mode_pretty}*")
-    lines.append(f"💥 Порог: *${float(c['liq_threshold_usd']):,.0f}* | 🪟 Окно: *{c['liq_window_sec']}с* (буфер 600с) | 🔎 Мин.ликв: *${c['liq_min_size_usd']}*")
+    thr_eff, thr_dyn = effective_liq_threshold(c)
+    thr_mark = " 📈(дин.)" if thr_dyn else ""
+    lines.append(f"💥 Порог: *${thr_eff:,.0f}*{thr_mark} | 🪟 Окно: *{c['liq_window_sec']}с* (буфер 600с) | 🔎 Мин.ликв: *${c['liq_min_size_usd']}*")
+    lines.append(_dyn_thr_status_line())
     min_mode_txt = ("⏭ пропускать вход" if get_min_size_mode() == "skip"
                     else "⬆️ заходить минимумом рынка")
     _em = get_entry_mode()
@@ -2306,6 +2329,12 @@ async def _scan_for_signal_impl(context):
 
     state = _load_state()
     async with aiohttp.ClientSession() as session:
+        # Динамический порог ликвидаций по объёму торгов: пересчёт
+        # один раз за тик (внутри кэш на несколько минут).
+        try:
+            await refresh_dynamic_threshold(session, c, symbols)
+        except Exception as e:
+            log.exception(f"refresh_dynamic_threshold err: {e}")
         for symbol in symbols:
             allowed, why = can_open_for(symbol)
             if not allowed:
@@ -2364,6 +2393,211 @@ async def _scan_open_position_impl(context):
             await _check_open_position(context, cid, session, c, state, sym, pos)
 
 
+# =========================================================
+# ДИНАМИЧЕСКИЙ ПОРОГ ЛИКВИДАЦИЙ ПО ОБЪЁМУ ТОРГОВ
+# =========================================================
+
+# Кэш расчёта: порог пересчитывается не чаще раза в _DYN_THR_TTL секунд
+# (часовые данные быстрее и не меняются).
+_dyn_thr: dict = {}
+_DYN_THR_TTL = 300
+
+
+def get_dyn_thr_cfg() -> tuple[bool, int, float, float]:
+    """Настройки динамического порога: (вкл, часов истории, мин $, макс $)."""
+    on = str(get_setting("liq_dyn_thr_on",
+                         DEFAULTS["liq_dyn_thr_on"]) or "0").strip() == "1"
+    try:
+        hours = int(float(get_setting("liq_dyn_thr_hours",
+                                      DEFAULTS["liq_dyn_thr_hours"]) or 24))
+    except (TypeError, ValueError):
+        hours = 24
+    hours = max(2, min(168, hours))
+    try:
+        thr_min = float(get_setting("liq_dyn_thr_min",
+                                    DEFAULTS["liq_dyn_thr_min"]) or 0)
+    except (TypeError, ValueError):
+        thr_min = 100000.0
+    try:
+        thr_max = float(get_setting("liq_dyn_thr_max",
+                                    DEFAULTS["liq_dyn_thr_max"]) or 0)
+    except (TypeError, ValueError):
+        thr_max = 1000000.0
+    thr_min = max(0.0, thr_min)
+    thr_max = max(0.0, thr_max)
+    if thr_min > thr_max:
+        thr_min, thr_max = thr_max, thr_min
+    return on, hours, thr_min, thr_max
+
+
+async def fetch_hourly_volumes(session, symbol: str, hours: int) -> dict:
+    """Объёмы торгов (в USDT) по ЗАКРЫТЫМ часовым свечам: {час_старт: объём}.
+
+    Источник — часовые свечи Gate.io (тот же, что бот использует для
+    свечей/импульса): поле quote_volume. Часы выровнены по UTC, поэтому
+    объёмы разных монет можно суммировать по метке часа.
+    """
+    data = await liq_api.fetch_json(
+        session, "https://api.gateio.ws/api/v4/spot/candlesticks",
+        params={"currency_pair": symbol, "interval": "1h",
+                "limit": hours + 2},
+    )
+    out: dict = {}
+    if not data or not isinstance(data, list):
+        return out
+    now = time.time()
+    for row in data:
+        try:
+            t = float(row[0])
+            vol = float(row[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        closed = (t + 3600) <= now
+        # У Gate в 8-м поле бывает флаг закрытия окна — он точнее часов.
+        try:
+            if len(row) >= 8:
+                flag = str(row[7]).lower()
+                if flag in ("true", "false"):
+                    closed = flag == "true"
+        except Exception:
+            pass
+        if closed and vol > 0:
+            out[t] = vol
+    return out
+
+
+def compute_dynamic_threshold(hour_sums: list, thr_min: float,
+                              thr_max: float) -> dict | None:
+    """Линейная растяжка порога по объёму последнего часа.
+
+    Объём ПОСЛЕДНЕГО закрытого часа внутри диапазона [мин, макс] объёмов
+    за N часов отображается в [thr_min, thr_max]:
+
+      ratio = (V_last − V_min) / (V_max − V_min)
+      порог = thr_min + ratio × (thr_max − thr_min)
+
+    Пример: за 24ч объёмы $10млрд–$100млрд, порог $100k–$1M; последний
+    час $30млрд → ratio 22.2% → порог $300k.
+    """
+    if not hour_sums:
+        return None
+    last = float(hour_sums[-1])
+    vmin = min(hour_sums)
+    vmax = max(hour_sums)
+    avg = sum(hour_sums) / len(hour_sums)
+    if vmax - vmin < 1e-9:
+        # Объёмы ровные — берём середину диапазона порогов.
+        ratio = 0.5
+    else:
+        ratio = max(0.0, min(1.0, (last - vmin) / (vmax - vmin)))
+    threshold = thr_min + ratio * (thr_max - thr_min)
+    return {
+        "threshold": round(threshold, 0),
+        "ratio": round(ratio, 4),
+        "last": last,
+        "min": float(vmin),
+        "max": float(vmax),
+        "avg": avg,
+        "n": len(hour_sums),
+    }
+
+
+async def refresh_dynamic_threshold(session, c: dict, symbols: list) -> None:
+    """Пересчитывает динамический порог (результат кэшируется).
+
+    Метрика активности рынка — сумма часовых объёмов торгов (USDT) по
+    ВСЕМ выбранным монетам: порог общий, поэтому и объём берём общий.
+    Суммируем только часы, где есть данные по каждой монете, чтобы
+    пропавшая свеча не занижала сумму.
+    """
+    on, hours, thr_min, thr_max = get_dyn_thr_cfg()
+    if not on:
+        _dyn_thr.clear()
+        return
+    now = time.time()
+    if _dyn_thr and now - float(_dyn_thr.get("calc_ts") or 0) < _DYN_THR_TTL:
+        return
+    try:
+        per_sym = {}
+        for sym in symbols:
+            try:
+                vols = await fetch_hourly_volumes(session, sym, hours)
+            except Exception as e:
+                log.debug(f"dyn thr fetch {sym} err: {e}")
+                vols = {}
+            if vols:
+                per_sym[sym] = vols
+        if not per_sym:
+            log.warning("liq: дин.порог — не удалось получить часовые объёмы")
+            _dyn_thr.update({"calc_ts": now, "error": "нет данных объёмов"})
+            return
+        common_ts = set.intersection(*[set(v) for v in per_sym.values()])
+        sums_ts = sorted(common_ts)[-hours:]
+        hour_sums = [sum(per_sym[s][t] for s in per_sym) for t in sums_ts]
+        info = compute_dynamic_threshold(hour_sums, thr_min, thr_max)
+        if not info:
+            _dyn_thr.update({"calc_ts": now, "error": "мало часовых данных"})
+            return
+        _dyn_thr.clear()
+        _dyn_thr.update(info)
+        _dyn_thr["calc_ts"] = now
+        _dyn_thr["error"] = ""
+        _dyn_thr["symbols"] = list(per_sym.keys())
+        log.info(
+            f"liq: 📈 дин.порог = ${info['threshold']:,.0f}: объём последнего "
+            f"часа ${info['last']:,.0f} (за {info['n']}ч: мин ${info['min']:,.0f}, "
+            f"макс ${info['max']:,.0f}, среднее ${info['avg']:,.0f}) при "
+            f"диапазоне порога ${thr_min:,.0f}–${thr_max:,.0f}"
+        )
+    except Exception as e:
+        log.warning(f"liq: дин.порог ошибка: {e}")
+        _dyn_thr.update({"calc_ts": now, "error": str(e)})
+
+
+def effective_liq_threshold(c: dict) -> tuple[float, bool]:
+    """Актуальный порог ликвидаций: (значение, динамический ли).
+
+    Динамический включён и рассчитан — берём его (в границах
+    liq_dyn_thr_min/max), иначе — статичный liq_threshold_usd.
+    """
+    static_thr = float(c["liq_threshold_usd"])
+    on, _hours, thr_min, thr_max = get_dyn_thr_cfg()
+    if on and _dyn_thr.get("threshold"):
+        thr = float(_dyn_thr["threshold"])
+        return max(thr_min, min(thr_max, thr)), True
+    return static_thr, False
+
+
+def _fmt_usd_short(x: float) -> str:
+    """$30500000000 → $30.5B; $1234000 → $1.23M; $999 → $999."""
+    x = float(x or 0)
+    if x >= 1e9:
+        return f"${x / 1e9:.2f}B"
+    if x >= 1e6:
+        return f"${x / 1e6:.2f}M"
+    if x >= 1e3:
+        return f"${x / 1e3:.1f}k"
+    return f"${x:,.0f}"
+
+
+def _dyn_thr_status_line() -> str:
+    """Строка статуса про динамический порог."""
+    on, hours, thr_min, thr_max = get_dyn_thr_cfg()
+    if not on:
+        return "📈 Динамический порог: выключен (работает статичный)"
+    if not _dyn_thr.get("threshold"):
+        err = _dyn_thr.get("error") or "данные ещё не получены"
+        return (f"📈 Динамический порог: {err} "
+                f"(диапазон {_fmt_usd_short(thr_min)}–{_fmt_usd_short(thr_max)}, "
+                f"история {hours}ч)")
+    return (f"📈 Динамический порог: *${float(_dyn_thr['threshold']):,.0f}* — "
+            f"объём последнего часа {_fmt_usd_short(_dyn_thr.get('last'))} "
+            f"(за {_dyn_thr.get('n', 0)}ч: мин {_fmt_usd_short(_dyn_thr.get('min'))}, "
+            f"макс {_fmt_usd_short(_dyn_thr.get('max'))}, "
+            f"среднее {_fmt_usd_short(_dyn_thr.get('avg'))}; "
+            f"диапазон {_fmt_usd_short(thr_min)}–{_fmt_usd_short(thr_max)})")
+
+
 async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
     """
     Поиск сигнала по одной монете:
@@ -2377,7 +2611,10 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
     """
     global _events_buffer
     window_sec = int(float(c["liq_window_sec"]))
-    threshold = float(c["liq_threshold_usd"])
+    # Порог: динамический (по объёму торгов), если включён и рассчитан,
+    # иначе статичный. Значение кладём в agg, чтобы сообщения/статистика
+    # показывали тот же порог, по которому сработал сигнал.
+    threshold, thr_is_dyn = effective_liq_threshold(c)
     min_usd = float(c["liq_min_size_usd"])
     tf = c["liq_timeframe"]
 
@@ -2400,6 +2637,8 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
 
     # 3. Агрегация
     agg = liq_api.aggregate_liquidations(_events_buffer[symbol], window_sec=window_sec)
+    agg["_threshold_eff"] = threshold
+    agg["_threshold_dyn"] = thr_is_dyn
 
     # 4. Свеча и OI (информативно)
     # Сохраняем источник свечи в кэш (gateio_spot / gateio_fut), чтобы
@@ -2452,9 +2691,10 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
     _save_last_liquidation(symbol, agg, _events_buffer[symbol], candle, oi_data)
 
     if agg["total_usd"] < threshold:
+        thr_mark = " (дин.)" if thr_is_dyn else ""
         set_setting(
             "liq_last_scan",
-            f"[{symbol}] каскад ${agg['total_usd']:,.0f} ниже порога ${threshold:,.0f} | {agg['dominant']} | свеча {candle} | буфер {len(_events_buffer[symbol])}",
+            f"[{symbol}] каскад ${agg['total_usd']:,.0f} ниже порога ${threshold:,.0f}{thr_mark} | {agg['dominant']} | свеча {candle} | буфер {len(_events_buffer[symbol])}",
         )
         return
     if agg["dominant"] == "NEUTRAL":
@@ -3538,7 +3778,9 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
         short_c = agg["short_count"]
         dom = agg["dominant"]
         by_ex = agg.get("by_exchange", {})
-        threshold = float(c["liq_threshold_usd"])
+        # Тот порог, по которому сигнал реально прошёл (динамический,
+        # если включён), а не статичный из настроек.
+        threshold = float(agg.get("_threshold_eff") or c["liq_threshold_usd"])
 
         power_bar = make_power_bar(total, threshold)
         ratio = total / threshold if threshold else 0

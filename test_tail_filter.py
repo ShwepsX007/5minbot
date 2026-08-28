@@ -27,6 +27,9 @@
  11. Фильтр ликвидаций убыточной свечи: объём ликвидаций убыточного
      окна сравнивается с «сигнальным» окном (больше/меньше N%)
      (раздел 14).
+ 12. Динамический порог ликвидаций по объёму торгов: линейная растяжка
+     порога между минимумом и максимумом в зависимости от объёма
+     последнего часа относительно истории (раздел 15).
 """
 import asyncio
 import os
@@ -962,6 +965,138 @@ async def main():
     el = ls._execution_status_line()
     check("попытки стакана видны в статусе",
           "попыток" in el and "сохраняется" in el, el)
+
+    print("\n=== 15. Динамический порог ликвидаций по объёму торгов ===")
+    check("дефолты дин.порога: выкл / 24ч / 100k / 1M",
+          ls.DEFAULTS["liq_dyn_thr_on"] == "0"
+          and ls.DEFAULTS["liq_dyn_thr_hours"] == "24"
+          and ls.DEFAULTS["liq_dyn_thr_min"] == "100000"
+          and ls.DEFAULTS["liq_dyn_thr_max"] == "1000000")
+
+    # Чистая математика растяжки
+    thr_min, thr_max = 100_000.0, 1_000_000.0
+    r = ls.compute_dynamic_threshold([10e9, 50e9, 100e9, 30e9], thr_min, thr_max)
+    check("пример пользователя: 30 из 10–100 млрд → порог $300k",
+          r is not None and abs(r["threshold"] - 300_000) < 1, str(r))
+    r = ls.compute_dynamic_threshold([10e9, 100e9, 10e9], thr_min, thr_max)
+    check("объём последнего часа = минимум → порог-минимум",
+          r is not None and abs(r["threshold"] - 100_000) < 1, str(r))
+    r = ls.compute_dynamic_threshold([10e9, 100e9, 100e9], thr_min, thr_max)
+    check("объём последнего часа = максимум → порог-максимум",
+          r is not None and abs(r["threshold"] - 1_000_000) < 1, str(r))
+    r = ls.compute_dynamic_threshold([50e9, 50e9, 50e9], thr_min, thr_max)
+    check("ровные объёмы (мин=макс) → середина диапазона",
+          r is not None and abs(r["threshold"] - 550_000) < 1, str(r))
+    check("пустая история → None",
+          ls.compute_dynamic_threshold([], thr_min, thr_max) is None)
+    r = ls.compute_dynamic_threshold([10e9, 20e9, 999e9], thr_min, thr_max)
+    check("выброс выше максимума → порог не выше максимума (clamp)",
+          r is not None and r["threshold"] <= thr_max, str(r))
+
+    # Чтение настроек и автообмен мин/макс
+    set_cfg(liq_dyn_thr_on="1", liq_dyn_thr_hours="24",
+            liq_dyn_thr_min="100000", liq_dyn_thr_max="1000000")
+    on, hours, tmin, tmax = ls.get_dyn_thr_cfg()
+    check("настройки дин.порога читаются",
+          on is True and hours == 24 and tmin == 100_000 and tmax == 1_000_000,
+          f"{on}/{hours}/{tmin}/{tmax}")
+    set_cfg(liq_dyn_thr_min="1000000", liq_dyn_thr_max="100000")
+    on, hours, tmin, tmax = ls.get_dyn_thr_cfg()
+    check("мин > макс → автоматически меняются местами",
+          tmin == 100_000 and tmax == 1_000_000, f"{tmin}/{tmax}")
+    set_cfg(liq_dyn_thr_min="100000", liq_dyn_thr_max="1000000")
+
+    # effective_liq_threshold
+    saved_dyn = dict(ls._dyn_thr)
+    ls._dyn_thr.clear()
+    thr, dyn = ls.effective_liq_threshold({"liq_threshold_usd": "150000"})
+    check("вкл, но расчёта ещё нет → статичный порог",
+          thr == 150_000 and dyn is False, f"{thr}/{dyn}")
+    ls._dyn_thr.update({"threshold": 300_000, "calc_ts": time.time()})
+    thr, dyn = ls.effective_liq_threshold({"liq_threshold_usd": "150000"})
+    check("вкл + есть расчёт → динамический порог",
+          thr == 300_000 and dyn is True, f"{thr}/{dyn}")
+    set_cfg(liq_dyn_thr_on="0")
+    thr, dyn = ls.effective_liq_threshold({"liq_threshold_usd": "150000"})
+    check("выкл → снова статичный порог",
+          thr == 150_000 and dyn is False, f"{thr}/{dyn}")
+    ls._dyn_thr.clear()
+    ls._dyn_thr.update(saved_dyn)
+    set_cfg(liq_dyn_thr_on="1")
+
+    # refresh_dynamic_threshold на заглушке часовых свечей
+    base_h = int(time.time() // 3600) * 3600
+    h1, h2 = base_h - 7200, base_h - 3600
+    vols_btc = {h1: 40e9, h2: 60e9}
+    vols_eth = {h1: 10e9, h2: 20e9}
+    calls = {"n": 0}
+
+    async def fake_fetch_json(session, url, params=None):
+        calls["n"] += 1
+        pair = (params or {}).get("currency_pair")
+        vols = vols_btc if pair == "BTC_USDT" else vols_eth
+        rows = [[str(t), str(vols[t]), "0", "0", "0", "0", "0", "true"]
+                for t in sorted(vols)]
+        # Текущий (незакрытый) час — должен игнорироваться
+        rows.append([str(base_h), "999", "0", "0", "0", "0", "0", "false"])
+        return rows
+
+    real_fj = ls.liq_api.fetch_json
+    ls.liq_api.fetch_json = fake_fetch_json
+    ls._dyn_thr.clear()
+    set_cfg(liq_dyn_thr_hours="2")
+    try:
+        await ls.refresh_dynamic_threshold(None, {}, ["BTC_USDT", "ETH_USDT"])
+        # суммы: h1=50B, h2=80B → последний час на максимуме → порог-макс
+        check("refresh: сумма объёмов монет, последний час=макс → порог-макс",
+              abs(float(ls._dyn_thr.get("threshold") or 0) - 1_000_000) < 1,
+              str(ls._dyn_thr))
+        check("refresh: незакрытый час не учитывается",
+              ls._dyn_thr.get("n") == 2, str(ls._dyn_thr.get("n")))
+        n_before = calls["n"]
+        await ls.refresh_dynamic_threshold(None, {}, ["BTC_USDT", "ETH_USDT"])
+        check("refresh: кэш TTL — повтор без запросов к API",
+              calls["n"] == n_before, f"{calls['n']} vs {n_before}")
+        ls._dyn_thr["calc_ts"] = time.time() - 9999  # форсируем протухание
+        await ls.refresh_dynamic_threshold(None, {}, ["BTC_USDT", "ETH_USDT"])
+        check("refresh: после протухания кэша — новый запрос",
+              calls["n"] > n_before, f"{calls['n']} vs {n_before}")
+    finally:
+        ls.liq_api.fetch_json = real_fj
+        ls._dyn_thr.clear()
+        ls._dyn_thr.update(saved_dyn)
+        set_cfg(liq_dyn_thr_on="0", liq_dyn_thr_hours="24")
+
+    # Строка статуса
+    set_cfg(liq_dyn_thr_on="0")
+    check("статус: дин.порог выключен",
+          "выключен" in ls._dyn_thr_status_line(), ls._dyn_thr_status_line())
+    set_cfg(liq_dyn_thr_on="1")
+    saved_dyn2 = dict(ls._dyn_thr)
+    ls._dyn_thr.clear()
+    ls._dyn_thr.update({"threshold": 300_000, "last": 30e9, "min": 10e9,
+                        "max": 100e9, "avg": 50e9, "n": 24,
+                        "calc_ts": time.time()})
+    line = ls._dyn_thr_status_line()
+    check("статус: дин.порог показывает значение и объёмы",
+          "300,000" in line and "30.00B" in line and "24ч" in line, line)
+    ls._dyn_thr.clear()
+    ls._dyn_thr.update(saved_dyn2)
+    set_cfg(liq_dyn_thr_on="0")
+
+    # Меню и ручной ввод
+    keys = [k for k, _, _ in liq_menu.PARAMS]
+    check("параметры дин.порога в меню",
+          all(k in keys for k in ("liq_dyn_thr_on", "liq_dyn_thr_hours",
+                                  "liq_dyn_thr_min", "liq_dyn_thr_max")))
+    ok, norm, err = liq_menu.validate_manual_input("liq_dyn_thr_on", "вкл")
+    check("ручной ввод «вкл» → 1", ok and norm == "1", err)
+    ok, norm, err = liq_menu.validate_manual_input("liq_dyn_thr_on", "off")
+    check("ручной ввод «off» → 0", ok and norm == "0", err)
+    ok, norm, err = liq_menu.validate_manual_input("liq_dyn_thr_hours", "24")
+    check("ручной ввод истории 24ч", ok and norm == "24", err)
+    ok, norm, err = liq_menu.validate_manual_input("liq_dyn_thr_hours", "999")
+    check("история 999ч > максимума 168 → ошибка", not ok)
 
     print(f"\nИТОГ: {PASS} прошло, {FAIL} упало")
     return FAIL
