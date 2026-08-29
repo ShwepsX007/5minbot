@@ -461,6 +461,11 @@ def get_event_markets(slug: str) -> Optional[dict]:
                 "active": bool(active),
                 "neg_risk": bool(m.get("negRisk", False)),
                 "accepting_orders": bool(m.get("acceptingOrders", active)),
+                # ВАЖНО: до официального разрешения рынка его outcomePrices —
+                # это ЖИВАЯ котировка (может быть 0.97/0.99 у исхода, который
+                # в итоге проиграет), а не результат. Верить цене можно только
+                # когда рынок официально разрешён (умаResolutionStatus).
+                "resolved": str(m.get("umaResolutionStatus") or "").strip().lower() == "resolved",
             })
 
         if not markets:
@@ -545,6 +550,33 @@ def get_book(token_id) -> Optional[dict]:
     except Exception as e:
         log.warning(f"get_book error: {e}")
         return None
+
+
+def get_live_price(token_id) -> Optional[dict]:
+    """Живая цена токена из стакана CLOB (в центах).
+
+    Гамма (outcomePrices) заметно отстаёт от рынка — в последние секунды
+    окна она может показывать 50-60¢ там, где в стакане уже 10-20¢
+    (кейс 27.08.2026). Для решений о продаже берём best_bid — сколько
+    реально дадут при немедленной продаже.
+
+    Возвращает {"bid": int, "ask": int, "mid": int} или None.
+    """
+    book = get_book(token_id)
+    if not book:
+        return None
+    try:
+        bid = float(book.get("best_bid"))
+        ask = float(book.get("best_ask"))
+    except (TypeError, ValueError):
+        return None
+    if bid <= 0 and ask <= 0:
+        return None
+    return {
+        "bid": max(0, min(100, int(round(bid * 100)))),
+        "ask": max(0, min(100, int(round(ask * 100)))),
+        "mid": max(0, min(100, int(round((bid + ask) / 2 * 100)))),
+    }
 
 
 # =========================================================

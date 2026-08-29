@@ -11,22 +11,46 @@
        свеча DOWN + ликвидируют ЛОНГОВ → входим UP  (контр-трейд)
        свеча UP   + ликвидируют ШОРТОВ → входим DOWN
      Если свеча и каскад смотрят в разные стороны — сигнал пропускаем.
-  4. Вход в СЛЕДУЮЩЕЕ окно, по рынку или лимиткой (liq_entry_mode).
+  4. ФИЛЬТР ХВОСТА ЛИКВИДАЦИЙ (liq_tail_*): перед самым входом бот ещё
+     раз смотрит ВСЕ ликвидации за окно liq_window_sec и выделяет
+     последние liq_tail_sec секунд («хвост»). Если доля объёма хвоста
+     от всего окна ВЫШЕ/НИЖЕ liq_tail_pct процентов (режим
+     liq_tail_mode) — бот НЕ входит.
+  5. Вход в СЛЕДУЮЩЕЕ окно, по рынку или лимиткой (liq_entry_mode).
+
+Если вход отменил фильтр, сигналы по этой монете ставятся на паузу
+(liq_signal_cooldown_sec): отменённый каскад ещё какое-то время
+превышает порог в окне агрегации, и без паузы бот тут же принял бы его
+как «новый» сигнал и вошёл со второй попытки.
 
 ВЫХОД:
+  0. Тейк по ПЕРВОЙ ставке (liq_tp_first_cents / liq_tp_first_sec):
+     первые N секунд окна бот пытается закрыть первый шаг серии
+     FAK-ордером, если цена нашего исхода дошла до уровня — откат после
+     каскада часто идёт в первые секунды, потом цену может переметнуть.
+     Закрыл → цикл завершён. Не успел за N секунд → обычный режим.
   1. Достигнут liq_tp_cents → продаём (лимиткой на TP, а если позиция
      меньше $5 — по рынку).
   2. За liq_new_order_time секунд до конца окна смотрим свечу ТЕКУЩЕГО
      окна, то есть где цена относительно старта рынка:
        • идёт в нашу сторону → НЕ закрываемся досрочно, ждём расчёта
          (раньше бот здесь сливал выигрышные позиции по 40¢);
-       • идёт против нас → шаг проигран: спасаем остаток продажей и
-         сразу открываем следующее окно в ТУ ЖЕ сторону с мартингейлом.
+       • идёт против нас → шаг проигран: спасаем остаток продажей.
   3. После конца окна итог определяем по закрытой свече этого окна
      (с перепроверкой ценой рынка). Выигрыш — серия сброшена, проигрыш —
      следующий шаг мартингейла в ту же сторону.
 
-Мартингейл идёт по таймеру внутри серии и не ждёт нового каскада.
+ПОВТОРНЫЙ ВХОД ПОСЛЕ УБЫТКА (liq_mg_entry = signal):
+  Бот оценивает УБЫТОЧНУЮ свечу тем же фильтром хвоста: все ликвидации
+  за окно liq_window_sec и последние liq_tail_sec секунд.
+    • хвост ПРОШЁЛ → бот входит в окно, следующее СРАЗУ за убыточным,
+      без ожидания и пропусков;
+    • хвост ЗАБЛОКИРОВАН → окно сразу после убытка пропускается; бот
+      ждёт, пока фильтр хвоста пустит одно из следующих окон (проверка
+      в конце каждого окна). Убыточное окно считается первым
+      заблокированным; после liq_mg_skip_windows заблокированных окон —
+      вход лотом liq_mg_skip_lot_pct% или остановка серии (при 0%).
+  При liq_mg_entry = timer — старое поведение: вход сразу по таймеру.
 """
 
 import json
@@ -79,6 +103,7 @@ def md_escape(text) -> str:
 STAT_KEYS = (
     "liq_stat_signals",        # сигналов принято в очередь
     "liq_stat_candle_cancel",  # отменено перепроверкой свечи
+    "liq_stat_filter_tail",    # отменено фильтром хвоста ликвидаций
     "liq_stat_filter_impulse",  # отменено фильтром импульса
     "liq_stat_filter_oi",      # отменено фильтром OI
     "liq_stat_filter_cvd",     # отменено фильтром потока
@@ -112,13 +137,14 @@ def _funnel_line() -> str:
         return ("🔻 Воронка сигналов: пока пусто — как появятся сигналы, "
                 "здесь будет видно работу фильтров")
     cc = _stat("liq_stat_candle_cancel")
+    ft = _stat("liq_stat_filter_tail")
     fi = _stat("liq_stat_filter_impulse")
     fo = _stat("liq_stat_filter_oi")
     fc = _stat("liq_stat_filter_cvd")
     ent = _stat("liq_stat_entries")
     return (f"🔻 Воронка: сигналов *{sig}* → свеча отсеяла *{cc}* → "
-            f"фильтры *{fi + fo + fc}* (импульс {fi} / OI {fo} / CVD {fc}) → "
-            f"входов *{ent}*")
+            f"фильтры *{ft + fi + fo + fc}* (хвост {ft} / импульс {fi} / "
+            f"OI {fo} / CVD {fc}) → входов *{ent}*")
 
 
 def _last_filters_line() -> str:
@@ -151,6 +177,16 @@ async def _send(context, cid, text, **kwargs):
 
 GATE_BASE = liq_api.GATE_BASE
 
+# Версия логики ликвидаций. Показывается в статус-экране, чтобы из
+# Telegram было видно, перезапущен ли бот с новым кодом. Обновлять при
+# каждом значимом изменении логики.
+STRATEGY_VERSION = ("28.08.2026 #7 — дин.порог по объёму торгов: режимы "
+                    "растяжка/от среднего, источник общий/своя монета; "
+                    "повторные попытки входа при тонком стакане (серия не "
+                    "сбрасывается), фильтр убыточной свечи; вердикт только "
+                    "после официального разрешения рынка, цены выходов из "
+                    "живого стакана")
+
 # ===================== ПАРАМЕТРЫ ПО УМОЛЧАНИЮ =====================
 DEFAULTS = {
     "liq_active":        "0",
@@ -159,6 +195,34 @@ DEFAULTS = {
     "liq_timeframe":     "5m",
     "liq_window_sec":    "60",
     "liq_threshold_usd": "150000",
+
+    # ===== ДИНАМИЧЕСКИЙ ПОРОГ ЛИКВИДАЦИЙ ПО ОБЪЁМУ ТОРГОВ =====
+    # Бот берёт часовые объёмы торгов (USDT) за последние
+    # liq_dyn_thr_hours часов, находит минимум/максимум/среднее и
+    # ЛИНЕЙНО растягивает порог ликвидаций между liq_dyn_thr_min и
+    # liq_dyn_thr_max в зависимости от того, где объём ПОСЛЕДНЕГО часа
+    # находится внутри диапазона [мин, макс].
+    # Пример: за 24ч объёмы $10млрд–$100млрд, порог $100k–$1M; последний
+    # час $30млрд → (30−10)/(100−10)=22.2% → порог $100k+22.2%×$900k=
+    # $300k. Активный рынок → порог выше (меньше шума), тихий → ниже.
+    # 0 — выключено (используется статичный Порог каскада).
+    "liq_dyn_thr_on": "0",
+    "liq_dyn_thr_hours": "24",
+    "liq_dyn_thr_min": "100000",
+    "liq_dyn_thr_max": "1000000",
+    # Режим расчёта:
+    #   "minmax" — линейная растяжка между порог-мин и порог-макс по
+    #              позиции объёма последнего часа внутри [мин,макс] истории;
+    #   "avg"    — порог = СЕРЕДИНА диапазона × (объём часа / средний объём),
+    #              ограничен [порог-мин, порог-макс]. Активность вдвое выше
+    #              средней → порог вдвое выше середины.
+    "liq_dyn_thr_mode": "minmax",
+    # Источник объёма:
+    #   "all"  — сумма часовых объёмов ВСЕХ выбранных монет (порог общий);
+    #   "self" — объём ТОЛЬКО своей монеты: у каждой монеты свой порог
+    #            (масштабы ликвидаций у BTC и XRP сильно разные).
+    "liq_dyn_thr_src": "all",
+
     "liq_check_interval": "5",
     "liq_min_size_usd":  "1000",
     "liq_base_stake":    "1",
@@ -182,6 +246,15 @@ DEFAULTS = {
     # не дошла до TP, за liq_new_order_time до конца окна бот закрывает по рынку
     # (текущая страховка). По умолчанию 90 — фиксируем почти всю прибыль.
     "liq_tp_cents":      "90",
+    # Тейк по ПЕРВОЙ ставке серии: первые liq_tp_first_sec секунд окна бот
+    # пытается закрыть позицию FAK-ордером, как только цена нашего исхода
+    # доходит до liq_tp_first_cents (и выше входа). Идея: откат после
+    # каскада ликвидаций часто происходит в первые секунды окна, а потом
+    # цену может переметнуть — лучше забрать текущий коэффициент, чем
+    # держать до расчёта. Успех → цикл завершён. Не успел — обычный режим.
+    # Действует только для первого шага серии (series == 0). 0 — выключено.
+    "liq_tp_first_cents": "75",
+    "liq_tp_first_sec":   "30",
     # Сколько последних сделок показывать в блоке «Последние сделки» статуса.
     "liq_recent_count":  "20",
     # Тип входа: "market" (по текущей лучшей цене) или "limit" (по entry_price_cents).
@@ -199,8 +272,12 @@ DEFAULTS = {
     # Сколько секунд после конца окна ждать ОФИЦИАЛЬНОГО расчёта рынка
     # Polymarket, прежде чем принять результат по свече. Пока время не
     # вышло и рынок не рассчитался — бот ждёт: цена рынка авторитетнее
-    # свечи, именно она определяет выплату.
-    "liq_market_confirm_wait": "120",
+    # свечи, именно она определяет выплату. 300с по умолчанию: рынки
+    # обычно резолвятся за 1–4 минуты, а гамма-АПИ иногда отражает
+    # исход с задержкой (27.08.2026: расчёт в 15:55:54, цены исходов
+    # обновились только к 15:59:15 — при 120с бот успел поверить свече
+    # и записал фантомный «плюс»).
+    "liq_market_confirm_wait": "300",
     # За сколько секунд до конца сигнальной свечи перепроверяем её
     # направление перед входом в следующее окно.
     "liq_entry_confirm_sec": "2",
@@ -227,17 +304,68 @@ DEFAULTS = {
     #   "classic"  — по старой схеме: первый лот × множитель^номер шага.
     "liq_martingale_mode": "recovery",
 
-    # ===== ШАГИ МАРТИНГЕЙЛА ТОЛЬКО ПО СВЕЖЕМУ СИГНАЛУ =====
-    # "signal" — вход в следующее окно только при подтверждении: живая
-    #            свеча нового окна идёт в нашу сторону ИЛИ случился
-    #            микро-каскад ликвидаций в нашу пользу;
-    # "timer"  — старое поведение: вход сразу по таймеру без подтверждения.
+    # ===== ШАГИ МАРТИНГЕЙЛА: ПОВТОРНЫЙ ВХОД ЧЕРЕЗ ФИЛЬТР ХВОСТА =====
+    # "signal" — после убытка бот оценивает УБЫТОЧНУЮ свечу фильтром
+    #            хвоста ликвидаций (настройки liq_tail_* ниже):
+    #              • хвост прошёл → вход в окно СРАЗУ за убыточным,
+    #                без ожидания и пропусков;
+    #              • хвост заблокирован → окно после убытка
+    #                пропускается, бот ждёт прохождения фильтра на
+    #                следующих окнах (убыточное окно — первый блок,
+    #                см. лимит пропусков ниже);
+    # "timer"  — старое поведение: вход сразу по таймеру без проверки.
     "liq_mg_entry": "signal",
-    # Сколько окон максимум ПРОПУСКАТЬ в ожидании подтверждения (1-3).
+    # Сколько окон максимум пропустить БЕЗ ВХОДА, когда фильтр хвоста
+    # блокирует продолжение серии (убыточное окно считается первым
+    # заблокированным). После лимита — вход лотом «после пропусков»
+    # или остановка серии (0-5).
     "liq_mg_skip_windows": "2",
     # Лот после исчерпания пропусков, % от расчётного (0 — остановить
     # серию, 100 — войти полным лотом).
     "liq_mg_skip_lot_pct": "50",
+
+    # ===== ФИЛЬТР ХВОСТА ЛИКВИДАЦИЙ =====
+    # Перед самым входом бот ещё раз смотрит ВСЕ ликвидации за окно
+    # агрегации liq_window_sec и выделяет последние liq_tail_sec секунд
+    # («хвост» окна). Доля ОБЪЁМА ликвидаций хвоста сравнивается с
+    # порогом liq_tail_pct (в % от всего окна):
+    #   режим "above" — доля хвоста ВЫШЕ порога → бот НЕ входит
+    #        (каскад сконцентрирован в самом конце окна: движение,
+    #        скорее всего, ещё продолжается, отката пока нет);
+    #   режим "below" — доля хвоста НИЖЕ порога → бот НЕ входит
+    #        (каскад затух, «топлива» для отката уже нет).
+    # Пример: окно 300с, хвост 50с, порог 50%, режим above — если за
+    # последние 50 секунд прошло больше 50% ликвидаций всего окна,
+    # вход отменяется.
+    # liq_tail_sec = 0 — фильтр выключен.
+    "liq_tail_sec": "50",
+    "liq_tail_pct": "50",
+    "liq_tail_mode": "above",
+
+    # ===== ФИЛЬТР ЛИКВИДАЦИЙ УБЫТОЧНОЙ СВЕЧИ =====
+    # Работает по аналогии с хвостом, но сравнивает ОБЪЁМ ликвидаций
+    # УБЫТОЧНОГО окна с объёмом «сигнального» окна (того, по которому
+    # бот заходил в рынок):
+    #   режим "больше" (above) — ликвидаций в убыточном окне БОЛЬШЕ
+    #     liq_loss_liq_pct% от сигнального → входа нет (шторм продолжается);
+    #   режим "меньше" (below) — ликвидаций в убыточном окне МЕНЬШЕ
+    #     liq_loss_liq_pct% от сигнального → входа нет (движение выдохлось).
+    # Пример: сигнал на $500k, порог «больше 50%». Проиграли, в убыточном
+    # окне $260k ликвидаций (52% от $500k) — больше порога, входа нет;
+    # $240k (48%) — меньше порога, вход есть.
+    # Применяется при ре-входе после убытка (вместе с фильтром хвоста).
+    # 0 — фильтр выключен.
+    "liq_loss_liq_on": "0",
+    "liq_loss_liq_pct": "50",
+    "liq_loss_liq_mode": "above",
+
+    # ===== ПАУЗА СИГНАЛОВ ПОСЛЕ ОТМЕНЫ ФИЛЬТРОМ =====
+    # Когда вход по монете отменил фильтр (хвост/импульс/OI/CVD), тот же
+    # самый каскад ликвидаций продолжает «светиться» в окне агрегации, и
+    # без паузы бот тут же принял бы его как «новый» сигнал и вошёл со
+    # второй попытки. Эта настройка — сколько секунд после отмены не
+    # принимать сигналы по данной монете. 0 — пауза выключена.
+    "liq_signal_cooldown_sec": "120",
 
     # ===== ФИЛЬТРЫ ИСПОЛНЕНИЯ =====
     # Максимальный спред bid-ask для входа, ¢ (0 — выключено).
@@ -245,6 +373,15 @@ DEFAULTS = {
     # Минимальная глубина стороны спроса (аск) в стакане, кратная ставке
     # (0 — выключено). Глубина считается в пределах 3¢ от лучшего аска.
     "liq_depth_mult": "2",
+    # Сколько всего попыток входа делать, если стакан оказался тонким
+    # (спред/глубина не прошли фильтр). Стакан может быть плохим «в
+    # моменте» и прийти в норму через пару секунд — поэтому между
+    # попытками ждём liq_exec_retry_sec секунд. 1 — одна попытка (старое
+    # поведение). Попытки прекращаются досрочно, если окно входа
+    # закрывается.
+    "liq_exec_retries": "3",
+    # Пауза между попытками входа при тонком стакане, сек.
+    "liq_exec_retry_sec": "5",
     # Максимальная цена входа, ¢ (0 — выключено). Выше — payoff слишком
     # плохой для контр-трейда, сигнал/шаг пропускается.
     "liq_max_entry_cents": "60",
@@ -259,6 +396,11 @@ DEFAULTS = {
 SIGNAL_CANDLE_BASIS = ("current", "prev")
 
 MARTINGALE_MODES = ("recovery", "classic")
+
+# Режимы фильтра хвоста ликвидаций:
+#   "above" — не входить, если доля хвоста ВЫШЕ порога;
+#   "below" — не входить, если доля хвоста НИЖЕ порога.
+TAIL_MODES = ("above", "below")
 
 MIN_SIZE_MODES = ("skip", "bump")
 CANDLE_SOURCES = ("chainlink", "gate_spot")
@@ -406,7 +548,7 @@ def set_param(key, value):
 def _empty_state() -> dict:
     """Свежее состояние: серии, позиции, отложенные входы и PnL серий."""
     return {"series": {}, "positions": {}, "pending": {}, "series_pnl": {},
-            "mg_pending": {}}
+            "mg_pending": {}, "cooldowns": {}}
 
 
 def _load_state() -> dict:
@@ -437,6 +579,9 @@ def _load_state() -> dict:
         st.setdefault("mg_pending", {})
         if not isinstance(st.get("mg_pending"), dict):
             st["mg_pending"] = {}
+        st.setdefault("cooldowns", {})
+        if not isinstance(st.get("cooldowns"), dict):
+            st["cooldowns"] = {}
         st.setdefault("series_pnl", {})
         if not isinstance(st["series_pnl"], dict):
             st["series_pnl"] = {}
@@ -741,10 +886,258 @@ def get_entry_mode() -> str:
 
 
 def get_mg_entry_mode() -> str:
-    """Шаги мартингейла: 'signal' — только по свежему подтверждению,
+    """Шаги мартингейла: 'signal' — повторный вход через фильтр хвоста,
     'timer' — сразу по таймеру (старое поведение)."""
     v = str(get_setting("liq_mg_entry", DEFAULTS["liq_mg_entry"]) or "").strip().lower()
     return v if v in ("signal", "timer") else "signal"
+
+
+def get_tail_mode() -> str:
+    """Режим фильтра хвоста: 'above' — блок, если доля хвоста выше порога,
+    'below' — блок, если ниже."""
+    v = str(get_setting("liq_tail_mode", DEFAULTS["liq_tail_mode"]) or "").strip().lower()
+    return v if v in TAIL_MODES else "above"
+
+
+def get_tail_filter_cfg() -> tuple[int, float, str]:
+    """Параметры фильтра хвоста ликвидаций: (tail_sec, pct, mode).
+
+    tail_sec — сколько последних секунд окна агрегации считать «хвостом»
+    (0 — фильтр выключен);
+    pct — порог доли хвоста в % от всего окна;
+    mode — 'above' / 'below' (см. get_tail_mode).
+    """
+    try:
+        tail_sec = int(float(get_setting("liq_tail_sec",
+                                         DEFAULTS["liq_tail_sec"]) or 0))
+    except (TypeError, ValueError):
+        tail_sec = 50
+    tail_sec = max(0, min(600, tail_sec))
+    try:
+        pct = float(get_setting("liq_tail_pct",
+                                DEFAULTS["liq_tail_pct"]) or 0)
+    except (TypeError, ValueError):
+        pct = 50.0
+    pct = max(0.0, min(100.0, pct))
+    return tail_sec, pct, get_tail_mode()
+
+
+def eval_tail_filter(symbol: str, now: float | None = None) -> dict:
+    """Фильтр хвоста ликвидаций.
+
+    Берём ВСЕ ликвидации за окно агрегации liq_window_sec (окно скользящее,
+    заканчивается «сейчас» — ровно то окно, из которого берутся ликвидации
+    для сигнала) и выделяем последние liq_tail_sec секунд («хвост» —
+    «за N секунд до конца периода»). Доля ОБЪЁМА ликвидаций хвоста
+    сравнивается с порогом liq_tail_pct:
+
+      режим "above" — доля хвоста ВЫШЕ порога → блок (не входить);
+      режим "below" — доля хвоста НИЖЕ порога → блок (не входить).
+
+    Один и тот же принцип используется в двух местах:
+      1. перед первичным входом по сигналу (см. check_entry_filters);
+      2. перед повторным входом после убытка — оценивается убыточная
+         свеча (см. планировщик мартингейла в _settle_position).
+
+    Возвращает словарь с цифрами и вердиктом:
+      enabled, blocked, why, share_pct, window_usd, tail_usd,
+      window_cnt, tail_cnt, window_sec, tail_sec, pct, mode.
+    """
+    now = time.time() if now is None else now
+    tail_sec, pct, mode = get_tail_filter_cfg()
+    try:
+        window_sec = cfg_int("liq_window_sec")
+    except Exception:
+        window_sec = 60
+
+    res = {
+        "enabled": tail_sec > 0,
+        "blocked": False,
+        "why": "",
+        "share_pct": 0.0,
+        "window_usd": 0.0,
+        "tail_usd": 0.0,
+        "window_cnt": 0,
+        "tail_cnt": 0,
+        "window_sec": window_sec,
+        "tail_sec": tail_sec,
+        "pct": pct,
+        "mode": mode,
+    }
+    if tail_sec <= 0:
+        res["why"] = "фильтр хвоста выключен (liq_tail_sec = 0)"
+        return res
+
+    # Хвост не может быть длиннее самого окна агрегации.
+    tail_span = min(tail_sec, window_sec)
+    res["tail_sec"] = tail_span
+    win_from = now - window_sec
+    tail_from = now - tail_span
+    for e in _events_buffer.get(symbol, []):
+        t = float(e.get("time", 0) or 0)
+        if t < win_from:
+            continue
+        usd = float(e.get("usd_value", 0) or 0)
+        res["window_usd"] += usd
+        res["window_cnt"] += 1
+        if t >= tail_from:
+            res["tail_usd"] += usd
+            res["tail_cnt"] += 1
+
+    total = res["window_usd"]
+    # Пустое окно = 0% хвоста: в режиме "above" это не блок, в "below" —
+    # блок (каскада фактически нет, «топлива» для отката не осталось).
+    share = (res["tail_usd"] / total * 100.0) if total > 0 else 0.0
+    res["share_pct"] = share
+
+    nums = (f"хвост {tail_span}с: ${res['tail_usd']:,.0f} "
+            f"({res['tail_cnt']} ликв.) = {share:.0f}% от окна "
+            f"{window_sec}с (${total:,.0f}, {res['window_cnt']} ликв.)")
+    if mode == "above" and share > pct:
+        res["blocked"] = True
+        res["why"] = (f"{nums} — выше порога {pct:g}%: каскад "
+                      f"сконцентрирован в конце окна, движение может "
+                      f"продолжаться")
+    elif mode == "below" and share < pct:
+        res["blocked"] = True
+        res["why"] = (f"{nums} — ниже порога {pct:g}%: каскад затух, "
+                      f"отката ждать не стоит")
+    else:
+        res["why"] = f"{nums} — условие блокировки ({mode} {pct:g}%) не сработало"
+    return res
+
+
+def window_liq_usd(symbol: str, win_start: float, win_end: float) -> float:
+    """Суммарный объём ликвидаций ($) в окне [win_start, win_end).
+
+    Считается по буферу событий (600с). Используется фильтром ликвидаций
+    убыточной свечи и для запоминания «сигнального» объёма при входе.
+    """
+    total = 0.0
+    for e in _events_buffer.get(symbol, []):
+        t = float(e.get("time", 0) or 0)
+        if win_start <= t < win_end:
+            total += float(e.get("usd_value", 0) or 0)
+    return round(total, 2)
+
+
+def get_loss_liq_filter_cfg() -> tuple[bool, float, str]:
+    """Настройки фильтра ликвидаций убыточной свечи: (вкл, порог %, режим)."""
+    on = str(get_setting("liq_loss_liq_on",
+                         DEFAULTS["liq_loss_liq_on"]) or "0").strip() == "1"
+    try:
+        pct = float(get_setting("liq_loss_liq_pct",
+                                DEFAULTS["liq_loss_liq_pct"]) or 0)
+    except (TypeError, ValueError):
+        pct = 50.0
+    pct = max(0.0, min(1000.0, pct))
+    mode = str(get_setting("liq_loss_liq_mode",
+                           DEFAULTS["liq_loss_liq_mode"])
+               or "above").strip().lower()
+    if mode not in ("above", "below"):
+        mode = "above"
+    return on, pct, mode
+
+
+def eval_loss_liq_filter(symbol: str, ref_liq_usd, loss_window_start: float,
+                         loss_window_end: float) -> dict:
+    """Фильтр ликвидаций убыточной свечи (по аналогии с фильтром хвоста).
+
+    Сравнивает ОБЪЁМ ликвидаций в УБЫТОЧНОМ окне с объёмом «сигнального»
+    окна (того, по которому бот заходил в рынок — он запоминается в
+    позиции при входе, поле ref_liq_usd):
+
+      режим "больше" (above) — ликвидаций в убыточном окне БОЛЬШЕ
+        N% от сигнального → блок (давление ликвидаций сохраняется,
+        движение может продолжиться против нас);
+      режим "меньше" (below) — ликвидаций в убыточном окне МЕНЬШЕ
+        N% от сигнального → блок (поток выдохся, продолжения не будет).
+
+    Пример (порог «больше 50%»): сигнал на $500k → убыточное окно $260k
+    (52%) — больше порога, входа нет; $240k (48%) — меньше, вход есть.
+
+    Возвращает: enabled, blocked, why, share_pct, loss_usd, ref_usd,
+    pct, mode.
+    """
+    on, pct, mode = get_loss_liq_filter_cfg()
+    loss_usd = window_liq_usd(symbol, loss_window_start, loss_window_end)
+    try:
+        ref = float(ref_liq_usd or 0)
+    except (TypeError, ValueError):
+        ref = 0.0
+    res = {
+        "enabled": on,
+        "blocked": False,
+        "why": "",
+        "share_pct": 0.0,
+        "loss_usd": loss_usd,
+        "ref_usd": ref,
+        "pct": pct,
+        "mode": mode,
+    }
+    if not on:
+        res["why"] = "фильтр убыточной свечи выключен"
+        return res
+    if ref <= 0:
+        res["why"] = ("нет объёма сигнального окна для сравнения — "
+                      "фильтр пропущен")
+        return res
+    share = loss_usd / ref * 100.0
+    res["share_pct"] = share
+    nums = (f"ликвидации убыточного окна ${loss_usd:,.0f} = {share:.0f}% "
+            f"от сигнального окна (${ref:,.0f})")
+    mode_txt = "больше" if mode == "above" else "меньше"
+    if mode == "above" and share > pct:
+        res["blocked"] = True
+        res["why"] = (f"{nums} — больше порога {pct:g}%: давление ликвидаций "
+                      f"сохраняется, движение может продолжиться")
+    elif mode == "below" and share < pct:
+        res["blocked"] = True
+        res["why"] = (f"{nums} — меньше порога {pct:g}%: поток ликвидаций "
+                      f"выдохся, продолжения ждать не стоит")
+    else:
+        res["why"] = (f"{nums} — условие блокировки "
+                      f"({mode_txt} {pct:g}%) не сработало")
+    return res
+
+
+def get_signal_cooldown_sec() -> int:
+    """Сколько секунд после отмены входа фильтром не принимать сигналы
+    по этой монете. 0 — пауза выключена."""
+    try:
+        v = int(float(get_setting("liq_signal_cooldown_sec",
+                                  DEFAULTS["liq_signal_cooldown_sec"]) or 0))
+    except (TypeError, ValueError):
+        v = 120
+    return max(0, min(600, v))
+
+
+def _signal_cooldown_left(state: dict, symbol: str) -> int:
+    """Сколько ещё секунд сигналы по монете на паузе после отмены фильтром.
+    0 — паузы нет."""
+    try:
+        ts = float((state.get("cooldowns") or {}).get(symbol, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    if ts <= 0:
+        return 0
+    left = ts + get_signal_cooldown_sec() - time.time()
+    return max(0, int(left))
+
+
+def _set_signal_cooldown(symbol: str):
+    """Ставит сигналы монеты на паузу (см. get_signal_cooldown_sec).
+
+    Вызывается при отмене входа фильтром: тот же каскад ликвидаций
+    остаётся в окне агрегации и без паузы немедленно повторно прошёл бы
+    как «свежий» сигнал.
+    """
+    cd = get_signal_cooldown_sec()
+    if cd <= 0:
+        return
+    state = _load_state()
+    state.setdefault("cooldowns", {})[symbol] = time.time()
+    _save_state(state)
 
 
 def get_max_entry_cents() -> int:
@@ -808,6 +1201,55 @@ def check_execution(token_id: str, stake_usd: float) -> tuple[bool, list[str], d
 
     detail = {"spread_cents": round(spread_cents, 1), "ask_depth_usd": round(depth_usd, 2)}
     return (not reasons), reasons, detail
+
+
+async def check_execution_retrying(token_id: str, stake_usd: float,
+                                   deadline: float | None = None
+                                   ) -> tuple[bool, list[str], dict, int]:
+    """Фильтр исполнения (спред/глубина) с несколькими попытками.
+
+    Стакан может быть тонким «в моменте» и прийти в норму уже на
+    следующем тике — поэтому при провале делаем ещё
+    liq_exec_retries−1 попыток с паузой liq_exec_retry_sec секунд.
+
+    deadline — конец окна входа: если до него осталось меньше 15 секунд,
+    попытки прекращаем, чтобы не отправлять ордер в закрывающееся окно.
+
+    Возвращает (прошёл ли, причины последней неудачи, детали,
+    сколько попыток сделано).
+    """
+    try:
+        retries = int(float(get_setting("liq_exec_retries",
+                                        DEFAULTS["liq_exec_retries"]) or 1))
+    except (TypeError, ValueError):
+        retries = 3
+    retries = max(1, min(10, retries))
+    try:
+        pause = float(get_setting("liq_exec_retry_sec",
+                                  DEFAULTS["liq_exec_retry_sec"]) or 5)
+    except (TypeError, ValueError):
+        pause = 5.0
+    pause = max(1.0, min(60.0, pause))
+
+    reasons: list[str] = []
+    detail: dict = {}
+    attempts = 0
+    for attempt in range(1, retries + 1):
+        attempts = attempt
+        ok, reasons, detail = check_execution(token_id, stake_usd)
+        if ok:
+            if attempt > 1:
+                log.info(f"liq: стакан пришёл в норму с попытки {attempt}")
+            return True, reasons, detail, attempt
+        if attempt >= retries:
+            break
+        if deadline is not None and time.time() + pause > deadline - 15:
+            log.info("liq: окно входа закрывается — прекращаю попытки стакана")
+            break
+        log.info(f"liq: тонкий стакан (попытка {attempt}/{retries}): "
+                 f"{reasons} — повтор через {pause:g}с")
+        await asyncio.sleep(pause)
+    return False, reasons, detail, attempts
 
 
 def any_active_position() -> bool:
@@ -972,7 +1414,10 @@ def _save_last_liquidation(symbol: str, agg: dict, events: list, candle: str | N
         "by_exchange": agg.get("by_exchange", {}),
         "candle": candle,
         "window_sec": int(float(get_setting("liq_window_sec", "60"))),
-        "threshold": float(get_setting("liq_threshold_usd", "150000")),
+        # Тот порог, по которому реально оценивался каскад (может быть
+        # динамическим — по объёму торгов).
+        "threshold": float((agg or {}).get("_threshold_eff")
+                           or get_setting("liq_threshold_usd", "150000")),
         "oi_total": (oi_data or {}).get("total", 0),
         "oi_breakdown": oi_data or {},
     }
@@ -1108,6 +1553,14 @@ def _filters_detail_line(details: dict) -> str:
     if not details:
         return "Данных фильтров нет."
     parts = []
+    if "tail" in details:
+        t = details["tail"]
+        mode_txt = "выше" if t.get("mode") == "above" else "ниже"
+        parts.append(
+            f"хвост {t.get('tail_sec', 0)}с: {t.get('share_pct', 0):.0f}% окна "
+            f"(${t.get('tail_usd', 0):,.0f} из ${t.get('window_usd', 0):,.0f}), "
+            f"порог {mode_txt} {t.get('pct', 0):g}%"
+        )
     if "oi_change_pct" in details:
         by_ex = details.get("oi_by_exchange") or {}
         if by_ex:
@@ -1130,8 +1583,20 @@ def _filters_status_line() -> str:
     streak = int(_f("liq_filter_impulse", 0))
     oi_lim = _f("liq_filter_oi_pct", 0)
     cvd_lim = _f("liq_filter_cvd", 0)
+    tail_sec, tail_pct, tail_mode = get_tail_filter_cfg()
 
     bits = []
+    if tail_sec > 0:
+        mode_txt = "выше" if tail_mode == "above" else "ниже"
+        bits.append(f"хвост {tail_sec}с/{tail_pct:g}% ({mode_txt})")
+    else:
+        bits.append("хвост ⛔")
+    loss_on, loss_pct, loss_mode = get_loss_liq_filter_cfg()
+    if loss_on:
+        loss_txt = "больше" if loss_mode == "above" else "меньше"
+        bits.append(f"убыт.свеча {loss_pct:g}% ({loss_txt})")
+    else:
+        bits.append("убыт.свеча ⛔")
     bits.append(f"импульс {streak} св./{_f('liq_filter_impulse_pct', 0):.2f}%"
                 if streak > 0 else "импульс ⛔")
     bits.append(f"OI +{oi_lim:.2f}%" if oi_lim > 0 else "OI ⛔")
@@ -1146,6 +1611,40 @@ def _filters_status_line() -> str:
     else:
         bits.append("CVD ⛔")
     return "🛡 Фильтры памп/дампа: " + " | ".join(bits)
+
+
+def _execution_status_line() -> str:
+    """Строка статуса: фильтры исполнения (стакан) и повторные попытки."""
+    try:
+        spread_max = float(get_setting("liq_spread_max_cents",
+                                       DEFAULTS["liq_spread_max_cents"]) or 0)
+    except (TypeError, ValueError):
+        spread_max = 3.0
+    try:
+        depth_mult = float(get_setting("liq_depth_mult",
+                                       DEFAULTS["liq_depth_mult"]) or 0)
+    except (TypeError, ValueError):
+        depth_mult = 2.0
+    try:
+        retries = int(float(get_setting("liq_exec_retries",
+                                        DEFAULTS["liq_exec_retries"]) or 1))
+    except (TypeError, ValueError):
+        retries = 3
+    try:
+        pause = int(float(get_setting("liq_exec_retry_sec",
+                                      DEFAULTS["liq_exec_retry_sec"]) or 5))
+    except (TypeError, ValueError):
+        pause = 5
+    if spread_max <= 0 and depth_mult <= 0:
+        return "🪞 Стакан: фильтры исполнения выключены"
+    bits = []
+    if spread_max > 0:
+        bits.append(f"спред ≤{spread_max:g}¢")
+    if depth_mult > 0:
+        bits.append(f"глубина ×{depth_mult:g}")
+    bits.append(f"попыток {max(1, min(10, retries))}×{max(1, min(60, pause))}с "
+                f"(серия при неудаче сохраняется)")
+    return "🪞 Стакан: " + " | ".join(bits)
 
 
 def _candle_source_line() -> str:
@@ -1208,10 +1707,14 @@ def get_status_text() -> str:
     else:
         lines.append(f"💱 Пары: *не выбраны* (открой ⚙️ Настройки) | ⏱ ТФ: `{c['liq_timeframe']}`")
     lines.append(f"🎮 Режим: {'ДЕМО' if is_demo_mode else 'РЕАЛ'}")
+    lines.append(f"⚙️ Версия логики: `{STRATEGY_VERSION}`")
     entry_mode = get_entry_mode()
     entry_mode_pretty = "🚀 Рыночный (по лучшей цене)" if entry_mode == "market" else "📋 Лимитный (по цене из настроек)"
     lines.append(f"🎯 Тип входа: *{entry_mode_pretty}*")
-    lines.append(f"💥 Порог: *${float(c['liq_threshold_usd']):,.0f}* | 🪟 Окно: *{c['liq_window_sec']}с* (буфер 600с) | 🔎 Мин.ликв: *${c['liq_min_size_usd']}*")
+    thr_eff, thr_dyn = effective_liq_threshold(c)
+    thr_mark = " 📈(дин.)" if thr_dyn else ""
+    lines.append(f"💥 Порог: *${thr_eff:,.0f}*{thr_mark} | 🪟 Окно: *{c['liq_window_sec']}с* (буфер 600с) | 🔎 Мин.ликв: *${c['liq_min_size_usd']}*")
+    lines.append(_dyn_thr_status_line())
     min_mode_txt = ("⏭ пропускать вход" if get_min_size_mode() == "skip"
                     else "⬆️ заходить минимумом рынка")
     _em = get_entry_mode()
@@ -1229,7 +1732,7 @@ def get_status_text() -> str:
                   else f"x{c['liq_martingale_mult']}^шаг")
     lines.append(f"💵 Лот: *{c['liq_base_stake']}$* | ♻️ Мартин: *{_mg_scheme}* | 🎯 Лимит-цена: *{c['liq_entry_price_cents']}¢* (кэп {c.get('liq_max_entry_cents', DEFAULTS['liq_max_entry_cents'])}¢) | 🧮 Макс.серия: *{c['liq_max_series']}*")
     lines.append(f"🚧 {min_lot_txt} | если лот меньше: *{min_mode_txt}*")
-    lines.append(f"🏁 TP: *{c['liq_tp_cents']}¢* | ⏰ Страховка: *{c['liq_new_order_time']}с* до конца окна | 🕘 В списке: *{c['liq_recent_count']}* сделок")
+    lines.append(f"🏁 TP: *{c['liq_tp_cents']}¢* | 🎯 1-й тейк: *{c.get('liq_tp_first_cents', DEFAULTS['liq_tp_first_cents'])}¢/{c.get('liq_tp_first_sec', DEFAULTS['liq_tp_first_sec'])}с* (0 — выкл) | ⏰ Страховка: *{c['liq_new_order_time']}с* до конца окна | 🕘 В списке: *{c['liq_recent_count']}* сделок")
     lines.append(f"🔁 Чек: {c['liq_check_interval']}с | 👁 Скан: {c['liq_scan_interval']}с")
     lines.append(_candle_source_line())
     _sb = ("🕯 свеча ликвидаций (текущее окно)" if get_signal_candle_basis() == "current"
@@ -1237,6 +1740,7 @@ def get_status_text() -> str:
     lines.append(f"🕯 Сигнальная свеча: *{_sb}*")
     lines.append(f"⏳ Перепроверка её направления: за *{get_entry_confirm_sec()}с* до закрытия окна")
     lines.append(_filters_status_line())
+    lines.append(_execution_status_line())
     lines.append(_funnel_line())
     _lf = _last_filters_line()
     if _lf:
@@ -1300,6 +1804,9 @@ def get_status_text() -> str:
                     )
                 else:
                     lines.append(f"{status_emoji} `{sym}` свободна | серия {ser}/{c['liq_max_series']} | буфер {buf} за 600с")
+            cd_left = _signal_cooldown_left(st, sym)
+            if cd_left > 0:
+                lines.append(f"   🧊 Сигналы на паузе ещё *{cd_left}с* (после отмены входа фильтром)")
             lines.append("")
     else:
         lines.append("📭 *Не выбрано ни одной пары — открой ⚙️ Настройки.*")
@@ -1317,10 +1824,10 @@ def get_status_text() -> str:
             )
         lines.append("")
 
-    # === Шаги мартингейла, ждущие подтверждения окна ===
+    # === Шаги мартингейла, ждущие окна, которое пустит фильтр хвоста ===
     mg_pending = st.get("mg_pending") or {}
     if mg_pending:
-        lines.append("👀 *Мартингейл ждёт подтверждения окна:*")
+        lines.append("👀 *Мартингейл ждёт окно, которое пустит фильтр хвоста:*")
         for sym, req in mg_pending.items():
             lines.append(
                 f"   `{sym}` → *{req.get('outcome','?')}* | шаг {req.get('series','?')} "
@@ -1835,6 +2342,12 @@ async def _scan_for_signal_impl(context):
 
     state = _load_state()
     async with aiohttp.ClientSession() as session:
+        # Динамический порог ликвидаций по объёму торгов: пересчёт
+        # один раз за тик (внутри кэш на несколько минут).
+        try:
+            await refresh_dynamic_threshold(session, c, symbols)
+        except Exception as e:
+            log.exception(f"refresh_dynamic_threshold err: {e}")
         for symbol in symbols:
             allowed, why = can_open_for(symbol)
             if not allowed:
@@ -1893,6 +2406,293 @@ async def _scan_open_position_impl(context):
             await _check_open_position(context, cid, session, c, state, sym, pos)
 
 
+# =========================================================
+# ДИНАМИЧЕСКИЙ ПОРОГ ЛИКВИДАЦИЙ ПО ОБЪЁМУ ТОРГОВ
+# =========================================================
+
+# Кэш расчёта: порог пересчитывается не чаще раза в _DYN_THR_TTL секунд
+# (часовые данные быстрее и не меняются).
+_dyn_thr: dict = {}
+_DYN_THR_TTL = 300
+
+
+def get_dyn_thr_cfg() -> tuple[bool, int, float, float, str, str]:
+    """Настройки динамического порога:
+    (вкл, часов истории, мин $, макс $, режим minmax/avg, источник all/self)."""
+    on = str(get_setting("liq_dyn_thr_on",
+                         DEFAULTS["liq_dyn_thr_on"]) or "0").strip() == "1"
+    try:
+        hours = int(float(get_setting("liq_dyn_thr_hours",
+                                      DEFAULTS["liq_dyn_thr_hours"]) or 24))
+    except (TypeError, ValueError):
+        hours = 24
+    hours = max(2, min(168, hours))
+    try:
+        thr_min = float(get_setting("liq_dyn_thr_min",
+                                    DEFAULTS["liq_dyn_thr_min"]) or 0)
+    except (TypeError, ValueError):
+        thr_min = 100000.0
+    try:
+        thr_max = float(get_setting("liq_dyn_thr_max",
+                                    DEFAULTS["liq_dyn_thr_max"]) or 0)
+    except (TypeError, ValueError):
+        thr_max = 1000000.0
+    thr_min = max(0.0, thr_min)
+    thr_max = max(0.0, thr_max)
+    if thr_min > thr_max:
+        thr_min, thr_max = thr_max, thr_min
+    mode = str(get_setting("liq_dyn_thr_mode",
+                           DEFAULTS["liq_dyn_thr_mode"])
+               or "minmax").strip().lower()
+    if mode not in ("minmax", "avg"):
+        mode = "minmax"
+    src = str(get_setting("liq_dyn_thr_src",
+                          DEFAULTS["liq_dyn_thr_src"])
+              or "all").strip().lower()
+    if src not in ("all", "self"):
+        src = "all"
+    return on, hours, thr_min, thr_max, mode, src
+
+
+async def fetch_hourly_volumes(session, symbol: str, hours: int) -> dict:
+    """Объёмы торгов (в USDT) по ЗАКРЫТЫМ часовым свечам: {час_старт: объём}.
+
+    Источник — часовые свечи Gate.io (тот же, что бот использует для
+    свечей/импульса): поле quote_volume. Часы выровнены по UTC, поэтому
+    объёмы разных монет можно суммировать по метке часа.
+    """
+    data = await liq_api.fetch_json(
+        session, "https://api.gateio.ws/api/v4/spot/candlesticks",
+        params={"currency_pair": symbol, "interval": "1h",
+                "limit": hours + 2},
+    )
+    out: dict = {}
+    if not data or not isinstance(data, list):
+        return out
+    now = time.time()
+    for row in data:
+        try:
+            t = float(row[0])
+            vol = float(row[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        closed = (t + 3600) <= now
+        # У Gate в 8-м поле бывает флаг закрытия окна — он точнее часов.
+        try:
+            if len(row) >= 8:
+                flag = str(row[7]).lower()
+                if flag in ("true", "false"):
+                    closed = flag == "true"
+        except Exception:
+            pass
+        if closed and vol > 0:
+            out[t] = vol
+    return out
+
+
+def compute_dynamic_threshold(hour_sums: list, thr_min: float,
+                              thr_max: float, mode: str = "minmax") -> dict | None:
+    """Порог по объёму последнего часа. Два режима (liq_dyn_thr_mode).
+
+    Режим "minmax" — линейная растяжка: объём ПОСЛЕДНЕГО закрытого часа
+    внутри диапазона [мин, макс] объёмов за N часов отображается в
+    [thr_min, thr_max]:
+
+      ratio = (V_last − V_min) / (V_max − V_min)
+      порог = thr_min + ratio × (thr_max − thr_min)
+
+      Пример: за 24ч объёмы $10млрд–$100млрд, порог $100k–$1M; последний
+      час $30млрд → ratio 22.2% → порог $300k.
+
+    Режим "avg" — порог пропорционален отклонению последнего часа от
+    СРЕДНЕГО объёма за историю; за «ноль активности» берём середину
+    диапазона порогов:
+
+      порог = (thr_min+thr_max)/2 × (V_last / V_avg),
+      ограничен [thr_min, thr_max].
+
+      Активность вдвое выше средней → порог вдвое выше середины диапазона.
+    """
+    if not hour_sums:
+        return None
+    last = float(hour_sums[-1])
+    vmin = min(hour_sums)
+    vmax = max(hour_sums)
+    avg = sum(hour_sums) / len(hour_sums)
+
+    if mode == "avg":
+        if avg <= 1e-9:
+            return None
+        ratio = last / avg
+        mid = (thr_min + thr_max) / 2.0
+        threshold = max(thr_min, min(thr_max, mid * ratio))
+    else:
+        if vmax - vmin < 1e-9:
+            # Объёмы ровные — берём середину диапазона порогов.
+            ratio = 0.5
+        else:
+            ratio = max(0.0, min(1.0, (last - vmin) / (vmax - vmin)))
+        threshold = thr_min + ratio * (thr_max - thr_min)
+
+    return {
+        "threshold": round(threshold, 0),
+        "ratio": round(ratio, 4),
+        "last": last,
+        "min": float(vmin),
+        "max": float(vmax),
+        "avg": avg,
+        "n": len(hour_sums),
+        "mode": mode,
+    }
+
+
+async def refresh_dynamic_threshold(session, c: dict, symbols: list) -> None:
+    """Пересчитывает динамический порог (результат кэшируется).
+
+    Считаются СРАЗУ оба варианта источника объёма:
+      • total     — сумма часовых объёмов (USDT) по ВСЕМ выбранным монетам
+                    (часы суммируются только там, где есть данные по каждой
+                    монете, чтобы пропавшая свеча не занижала сумму);
+      • by_symbol — объём каждой монеты отдельно (свой порог на монету).
+    Какой из них используется — настройка liq_dyn_thr_src (all/self).
+    """
+    on, hours, thr_min, thr_max, mode, src = get_dyn_thr_cfg()
+    if not on:
+        _dyn_thr.clear()
+        return
+    now = time.time()
+    if _dyn_thr and now - float(_dyn_thr.get("calc_ts") or 0) < _DYN_THR_TTL:
+        return
+    try:
+        per_sym = {}
+        for sym in symbols:
+            try:
+                vols = await fetch_hourly_volumes(session, sym, hours)
+            except Exception as e:
+                log.debug(f"dyn thr fetch {sym} err: {e}")
+                vols = {}
+            if vols:
+                per_sym[sym] = vols
+        if not per_sym:
+            log.warning("liq: дин.порог — не удалось получить часовые объёмы")
+            _dyn_thr.update({"calc_ts": now, "error": "нет данных объёмов"})
+            return
+
+        # Порог по каждой монете отдельно (источник "self").
+        by_symbol = {}
+        for sym, vols in per_sym.items():
+            ts_last = sorted(vols)[-hours:]
+            info_sym = compute_dynamic_threshold(
+                [vols[t] for t in ts_last], thr_min, thr_max, mode)
+            if info_sym:
+                by_symbol[sym] = info_sym
+
+        # Общий порог по сумме объёмов всех монет (источник "all").
+        total_info = None
+        if len(per_sym) >= 1:
+            common_ts = set.intersection(*[set(v) for v in per_sym.values()])
+            sums_ts = sorted(common_ts)[-hours:]
+            hour_sums = [sum(per_sym[s][t] for s in per_sym) for t in sums_ts]
+            total_info = compute_dynamic_threshold(hour_sums, thr_min,
+                                                   thr_max, mode)
+
+        if not total_info and not by_symbol:
+            _dyn_thr.update({"calc_ts": now, "error": "мало часовых данных"})
+            return
+
+        _dyn_thr.clear()
+        _dyn_thr.update({
+            "calc_ts": now,
+            "error": "",
+            "mode": mode,
+            "src": src,
+            "total": total_info,
+            "by_symbol": by_symbol,
+        })
+        if src == "self":
+            parts = ", ".join(
+                f"{s.replace('_USDT', '')}=${by_symbol[s]['threshold']:,.0f}"
+                for s in by_symbol)
+            log.info(f"liq: 📈 дин.порог по монетам ({mode}, {hours}ч): {parts}")
+        elif total_info:
+            log.info(
+                f"liq: 📈 дин.порог = ${total_info['threshold']:,.0f} ({mode}, "
+                f"{hours}ч): объём последнего часа ${total_info['last']:,.0f} "
+                f"(мин ${total_info['min']:,.0f}, макс ${total_info['max']:,.0f}, "
+                f"среднее ${total_info['avg']:,.0f}) при диапазоне порога "
+                f"${thr_min:,.0f}–${thr_max:,.0f}"
+            )
+    except Exception as e:
+        log.warning(f"liq: дин.порог ошибка: {e}")
+        _dyn_thr.update({"calc_ts": now, "error": str(e)})
+
+
+def effective_liq_threshold(c: dict, symbol: str | None = None) -> tuple[float, bool]:
+    """Актуальный порог ликвидаций: (значение, динамический ли).
+
+    Источник "all"  — общий порог по сумме объёмов всех монет;
+    источник "self" — порог по объёму именно этой монеты (если для неё
+    нет расчёта — откатываемся на общий, затем на статичный).
+    Динамический включён и рассчитан — берём его (в границах
+    liq_dyn_thr_min/max), иначе — статичный liq_threshold_usd.
+    """
+    static_thr = float(c["liq_threshold_usd"])
+    on, _hours, thr_min, thr_max, _mode, src = get_dyn_thr_cfg()
+    if not on:
+        return static_thr, False
+    info = None
+    if src == "self" and symbol:
+        info = (_dyn_thr.get("by_symbol") or {}).get(symbol)
+    if not info or not info.get("threshold"):
+        info = _dyn_thr.get("total")
+    if not info or not info.get("threshold"):
+        return static_thr, False
+    thr = float(info["threshold"])
+    return max(thr_min, min(thr_max, thr)), True
+
+
+def _fmt_usd_short(x: float) -> str:
+    """$30500000000 → $30.5B; $1234000 → $1.23M; $999 → $999."""
+    x = float(x or 0)
+    if x >= 1e9:
+        return f"${x / 1e9:.2f}B"
+    if x >= 1e6:
+        return f"${x / 1e6:.2f}M"
+    if x >= 1e3:
+        return f"${x / 1e3:.1f}k"
+    return f"${x:,.0f}"
+
+
+def _dyn_thr_status_line() -> str:
+    """Строка статуса про динамический порог."""
+    on, hours, thr_min, thr_max, mode, src = get_dyn_thr_cfg()
+    if not on:
+        return "📈 Динамический порог: выключен (работает статичный)"
+    mode_txt = "растяжка мин-макс" if mode == "minmax" else "от среднего"
+    rng = (f"диапазон {_fmt_usd_short(thr_min)}–{_fmt_usd_short(thr_max)}, "
+           f"история {hours}ч, {mode_txt}")
+
+    if src == "self":
+        by_sym = _dyn_thr.get("by_symbol") or {}
+        if not by_sym:
+            err = _dyn_thr.get("error") or "данные ещё не получены"
+            return f"📈 Дин.порог по монетам: {err} ({rng})"
+        parts = [f"{s.replace('_USDT', '')} *${float(i['threshold']):,.0f}*"
+                 f" (час {_fmt_usd_short(i.get('last'))}/ср {_fmt_usd_short(i.get('avg'))})"
+                 for s, i in by_sym.items()]
+        return f"📈 Дин.порог по объёму каждой монеты: {' | '.join(parts)} ({rng})"
+
+    info = _dyn_thr.get("total")
+    if not info or not info.get("threshold"):
+        err = _dyn_thr.get("error") or "данные ещё не получены"
+        return f"📈 Динамический порог: {err} ({rng})"
+    return (f"📈 Динамический порог: *${float(info['threshold']):,.0f}* — "
+            f"объём последнего часа {_fmt_usd_short(info.get('last'))} "
+            f"(за {info.get('n', 0)}ч: мин {_fmt_usd_short(info.get('min'))}, "
+            f"макс {_fmt_usd_short(info.get('max'))}, "
+            f"среднее {_fmt_usd_short(info.get('avg'))}; {rng})")
+
+
 async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
     """
     Поиск сигнала по одной монете:
@@ -1906,7 +2706,11 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
     """
     global _events_buffer
     window_sec = int(float(c["liq_window_sec"]))
-    threshold = float(c["liq_threshold_usd"])
+    # Порог: динамический (по объёму торгов), если включён и рассчитан,
+    # иначе статичный. Значение кладём в agg, чтобы сообщения/статистика
+    # показывали тот же порог, по которому сработал сигнал. При источнике
+    # "self" у каждой монеты свой порог — поэтому передаём symbol.
+    threshold, thr_is_dyn = effective_liq_threshold(c, symbol)
     min_usd = float(c["liq_min_size_usd"])
     tf = c["liq_timeframe"]
 
@@ -1929,6 +2733,8 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
 
     # 3. Агрегация
     agg = liq_api.aggregate_liquidations(_events_buffer[symbol], window_sec=window_sec)
+    agg["_threshold_eff"] = threshold
+    agg["_threshold_dyn"] = thr_is_dyn
 
     # 4. Свеча и OI (информативно)
     # Сохраняем источник свечи в кэш (gateio_spot / gateio_fut), чтобы
@@ -1981,9 +2787,10 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
     _save_last_liquidation(symbol, agg, _events_buffer[symbol], candle, oi_data)
 
     if agg["total_usd"] < threshold:
+        thr_mark = " (дин.)" if thr_is_dyn else ""
         set_setting(
             "liq_last_scan",
-            f"[{symbol}] каскад ${agg['total_usd']:,.0f} ниже порога ${threshold:,.0f} | {agg['dominant']} | свеча {candle} | буфер {len(_events_buffer[symbol])}",
+            f"[{symbol}] каскад ${agg['total_usd']:,.0f} ниже порога ${threshold:,.0f}{thr_mark} | {agg['dominant']} | свеча {candle} | буфер {len(_events_buffer[symbol])}",
         )
         return
     if agg["dominant"] == "NEUTRAL":
@@ -2038,6 +2845,22 @@ async def _look_for_signal(context, cid, session, c, state, symbol, enter=True):
         )
         return
 
+    # === Пауза сигналов после отмены входа фильтром ===
+    # Отменённый каскад продолжает превышать порог, пока не устареет в
+    # окне агрегации. Без паузы бот на следующем же тике принял бы ТУ ЖЕ
+    # самую ликвидационную волну как «новый» сигнал и вошёл со второй
+    # попытки — сразу после того, как фильтр её забраковал.
+    cd_left = _signal_cooldown_left(state, symbol)
+    if cd_left > 0:
+        set_setting(
+            "liq_last_scan",
+            f"[{symbol}] каскад {agg['dominant']} ${agg['total_usd']:,.0f} — "
+            f"сигналы на паузе ещё {cd_left}с (отмена фильтром)",
+        )
+        log.info(f"Signal {symbol}: каскад ${agg['total_usd']:.0f} — пауза после "
+                 f"отмены фильтром, ещё {cd_left}с, сигнал не принимаю")
+        return
+
     # Финальная защита: проверяем can_open_for ещё раз непосредственно
     # перед входом — между решением scan_for_signal и записью позиции в
     # state могло что-то измениться (гонка задач, _check_open_position
@@ -2069,74 +2892,53 @@ def get_entry_confirm_sec() -> int:
     return max(1, min(60, v))
 
 
-# ===================== МАРТИНГЕЙЛ ПО СВЕЖЕМУ СИГНАЛУ =====================
-# Через сколько секунд после начала окна проверяем подтверждение: свеча
-# должна успеть сформироваться, иначе «направление» — это шум первой секунды.
-MG_CONFIRM_AT_SEC = 45
-# Минимальный остаток окна для входа после подтверждения.
-MG_MIN_LEFT_SEC = 60
+# ===================== МАРТИНГЕЙЛ ЧЕРЕЗ ФИЛЬТР ХВОСТА =====================
+# За сколько секунд ДО КОНЦА окна проверяем фильтр хвоста ликвидаций:
+# к этому моменту хвост («последние liq_tail_sec секунд окна») уже
+# накопился и его долю можно посчитать. После проверки вход происходит
+# в следующее окно.
+MG_TAIL_LEAD_SEC = 5
 
 _mg_lock = asyncio.Lock()
 
 
 async def _mg_window_confirmed(session, symbol: str, tf: str,
                                outcome: str, window_start: float) -> tuple[bool, str]:
-    """Есть ли свежее подтверждение входа в сторону outcome.
+    """Подтверждено ли окно для шага мартингейла.
 
-    Считается подтверждением:
-      1. Живая свеча текущего окна идёт в нашу сторону (close > open для UP);
-      2. Микро-каскад ликвидаций за окно агрегации в контр-направлении
-         (лонги вылетают → поддержка UP, шорты → поддержка DOWN) — та же
-         логика, по которой работает основной сигнал стратегии.
+    Старое подтверждение («живая свеча окна идёт в нашу сторону или
+    микро-каскад ликвидаций в нашу пользу») работало некорректно и
+    заменено ФИЛЬТРОМ ХВОСТА ЛИКВИДАЦИЙ — тем же принципом, что и перед
+    первичным входом:
+
+      берём все ликвидации за окно liq_window_sec и последние
+      liq_tail_sec секунд; если доля хвоста ВЫШЕ/НИЖЕ liq_tail_pct
+      (режим liq_tail_mode) — окно НЕ подтверждено.
+
+    Если фильтр выключен (liq_tail_sec = 0) — окно считается
+    подтверждённым по умолчанию.
     """
-    # 1) Свеча окна
     try:
-        cndl = await get_window_candle(session, symbol, tf, window_start)
+        tail = eval_tail_filter(symbol)
     except Exception as e:
-        log.debug(f"mg confirm candle err: {e}")
-        cndl = None
-    if cndl and cndl.get("open"):
-        state_now = resolve_state(cndl)
-        delta_pct = (cndl["close"] - cndl["open"]) / cndl["open"] * 100
-        if state_now == outcome:
-            return True, (f"свеча окна идёт {state_now} ({delta_pct:+.3f}%) "
-                          f"— в нашу сторону")
-        return False, f"свеча окна идёт {state_now} ({delta_pct:+.3f}%) против {outcome}"
-
-    # 2) Микро-каскад
-    try:
-        c = cfg()
-        window_sec = int(float(c["liq_window_sec"]))
-        threshold = float(c["liq_threshold_usd"])
-        events = _events_buffer.get(symbol) or []
-        agg = liq_api.aggregate_liquidations(events, window_sec=window_sec)
-        total = float(agg.get("total_usd") or 0)
-        long_usd = float(agg.get("long_liq_usd") or 0)
-        short_usd = float(agg.get("short_liq_usd") or 0)
-        need = threshold * 0.3
-        if total >= need:
-            if long_usd > short_usd and outcome == "UP":
-                return True, (f"микро-каскад ${total:,.0f} (лонги ${long_usd:,.0f}) "
-                              f"— поддержка UP")
-            if short_usd > long_usd and outcome == "DOWN":
-                return True, (f"микро-каскад ${total:,.0f} (шорты ${short_usd:,.0f}) "
-                              f"— поддержка DOWN")
-            dom = "лонги" if long_usd >= short_usd else "шорты"
-            return False, f"каскад ${total:,.0f} не в нашу сторону (вылетают {dom})"
-        return False, f"каскад слабый (${total:,.0f} < ${need:,.0f})"
-    except Exception as e:
-        log.debug(f"mg confirm cascade err: {e}")
-        return False, "нет данных для подтверждения"
+        log.debug(f"mg tail filter err: {e}")
+        return False, "нет данных по ликвидациям для фильтра хвоста"
+    if not tail["enabled"]:
+        return True, "фильтр хвоста выключен"
+    if tail["blocked"]:
+        return False, tail["why"]
+    return True, tail["why"]
 
 
 async def process_mg_pending(context):
     """Проверяет окна для отложенных шагов мартингейла (режим signal).
 
     Вызывается из обоих джобов, поэтому нужен свой лок. Для каждой
-    записи mg_pending: дождаться момента проверки окна (старт + 45с),
-    проверить подтверждение и либо войти полным лотом, либо пропустить
-    окно (счётчик skips_used), либо после исчерпания пропусков войти
-    уменьшенным лотом lot_pct% (0 — остановить серию).
+    записи mg_pending: дождаться конца окна (за MG_TAIL_LEAD_SEC секунд
+    до его закрытия), прогнать фильтр хвоста ликвидаций и либо войти
+    полным лотом в следующее окно, либо пропустить окно (счётчик
+    skips_used), либо после исчерпания пропусков войти уменьшенным
+    лотом lot_pct% (0 — остановить серию).
     """
     if _mg_lock.locked():
         log.debug("process_mg_pending: уже выполняется, пропускаю тик")
@@ -2208,10 +3010,10 @@ async def _mg_pending_check_one(context, session, c, symbol: str, req: dict, now
     checked_window = int(req.get("checked_window") or 0)
     if checked_window == cur_start:
         return  # это окно уже проверяли — ждём следующего
-    if now < cur_start + MG_CONFIRM_AT_SEC:
-        return  # свеча ещё не сформировалась
-    if cur_end - now < MG_MIN_LEFT_SEC:
-        return  # окно почти кончилось — проверим следующее (не считая пропуском)
+    # Фильтр хвоста оценивается «за N секунд до конца периода»: ждём,
+    # пока хвост окна (последние liq_tail_sec секунд) накопится.
+    if now < cur_end - MG_TAIL_LEAD_SEC:
+        return
 
     confirmed, why = await _mg_window_confirmed(session, symbol, tf, outcome, cur_start)
 
@@ -2226,18 +3028,22 @@ async def _mg_pending_check_one(context, session, c, symbol: str, req: dict, now
     win_str = datetime.fromtimestamp(cur_start, tz=timezone.utc).strftime("%H:%M:%S UTC")
 
     if confirmed:
-        log.info(f"liq: ♻️ {symbol} шаг {series} подтверждён: {why}")
+        log.info(f"liq: ♻️ {symbol} шаг {series} прошёл фильтр хвоста: {why}")
         state.setdefault("mg_pending", {}).pop(symbol, None)
         _save_state(state)
         stake, _why = compute_stake(c, state, symbol, series)
         stake = round(stake, 2)
+        # Проверка прошла у самой границы окна — вход будет в СЛЕДУЮЩЕЕ
+        # окно. Даём Polymarket секунду на генерацию его слава.
+        await asyncio.sleep(1.0)
         await _enter_martingale_step(context, cid, c, state, symbol,
                                      stake, series, tf,
                                      carried_outcome=outcome,
-                                     entry_note=why)
+                                     entry_note=f"фильтр хвоста: {why}",
+                                     ref_liq_usd=window_liq_usd(symbol, cur_start, cur_end))
         return
 
-    # Не подтверждено
+    # Фильтр хвоста окно не пропустил
     skips_used = int(req.get("skips_used") or 0)
     if skips_used < max_skip:
         state = _load_state()
@@ -2245,12 +3051,12 @@ async def _mg_pending_check_one(context, session, c, symbol: str, req: dict, now
         if symbol in mg_map:
             mg_map[symbol]["skips_used"] = skips_used + 1
             _save_state(state)
-        log.info(f"liq: ⏭ {symbol} окно {win_str} без подтверждения ({why}) — "
+        log.info(f"liq: ⏭ {symbol} окно {win_str} не прошло фильтр хвоста ({why}) — "
                  f"пропуск {skips_used + 1}/{max_skip}")
         try:
             await _send(
                 context, cid,
-                f"⏭ *Окно без подтверждения* `{symbol}` {outcome}\n"
+                f"⏭ *Окно не прошло фильтр хвоста* `{symbol}` {outcome}\n"
                 f"🕐 {win_str}: {md_escape(why)}\n"
                 f"Пропускаю ({skips_used + 1}/{max_skip}), жду следующее окно.",
                 parse_mode="Markdown",
@@ -2266,33 +3072,35 @@ async def _mg_pending_check_one(context, session, c, symbol: str, req: dict, now
     if lot_pct > 0:
         stake, _why = compute_stake(c, state, symbol, series)
         stake = round(stake * lot_pct / 100.0, 2)
-        log.info(f"liq: {symbol} подтверждения нет {max_skip} окон — вход "
+        log.info(f"liq: {symbol} фильтр хвоста не пустил {max_skip} окон — вход "
                  f"лотом {stake}$ ({lot_pct:g}% от расчёта)")
         _save_state(state)
         try:
             await _send(
                 context, cid,
-                f"⚠️ *Подтверждения нет* `{symbol}` {outcome} за {max_skip} окон — "
+                f"⚠️ *Фильтр хвоста не пустил* `{symbol}` {outcome} за {max_skip} окон — "
                 f"вхожу лотом *{stake}$* ({lot_pct:g}% от расчётного).",
                 parse_mode="Markdown",
             )
         except Exception:
             pass
+        await asyncio.sleep(1.0)
         await _enter_martingale_step(context, cid, c, state, symbol,
                                      stake, series, tf,
                                      carried_outcome=outcome,
                                      entry_note=f"вход после {max_skip} окон без "
-                                                f"подтверждения, лот {lot_pct:g}%")
+                                                f"фильтра хвоста, лот {lot_pct:g}%",
+                                     ref_liq_usd=window_liq_usd(symbol, cur_start, cur_end))
     else:
         state["series"][symbol] = 0
         state.setdefault("series_pnl", {}).pop(symbol, None)
         _save_state(state)
-        log.info(f"liq: {symbol} подтверждения нет {max_skip} окон — серия остановлена")
+        log.info(f"liq: {symbol} фильтр хвоста не пустил {max_skip} окон — серия остановлена")
         try:
             await _send(
                 context, cid,
                 f"🛑 *Мартингейл остановлен* `{symbol}` {outcome}\n"
-                f"Подтверждения не дождались за {max_skip} окон "
+                f"Фильтр хвоста не пустил за {max_skip} окон "
                 f"(лот после пропусков = 0%). Ждём новый сигнал.",
                 parse_mode="Markdown",
             )
@@ -2489,9 +3297,36 @@ def _cvd_check(symbol: str, outcome: str, t0: float, t1: float,
 async def check_entry_filters(session, symbol: str, outcome: str, tf: str,
                               signal_window_start: float,
                               signal_window_end: float) -> tuple[bool, list, dict]:
-    """Фильтры безоткатных движений. Возвращает (можно_входить, причины, детали)."""
+    """Фильтры входа. Возвращает (можно_входить, причины, детали).
+
+    Первым идёт фильтр хвоста ликвидаций: перед самым входом бот ещё раз
+    смотрит ВСЕ ликвидации за окно агрегации и долю последних
+    liq_tail_sec секунд — если она выше/ниже порога (режим
+    liq_tail_mode), вход отменяется.
+    """
     reasons = []
     details = {}
+
+    # --- 0. Фильтр хвоста ликвидаций ---
+    tail_sec_cfg, _tail_pct_cfg, _tail_mode_cfg = get_tail_filter_cfg()
+    if tail_sec_cfg > 0:
+        try:
+            tail = eval_tail_filter(symbol)
+            details["tail"] = {
+                "share_pct": round(tail["share_pct"], 1),
+                "tail_usd": round(tail["tail_usd"]),
+                "window_usd": round(tail["window_usd"]),
+                "tail_cnt": tail["tail_cnt"],
+                "window_cnt": tail["window_cnt"],
+                "tail_sec": tail["tail_sec"],
+                "window_sec": tail["window_sec"],
+                "pct": tail["pct"],
+                "mode": tail["mode"],
+            }
+            if tail["blocked"]:
+                reasons.append(f"хвост ликвидаций: {tail['why']}")
+        except Exception as e:
+            log.debug(f"tail filter err: {e}")
 
     # --- 1. Импульс по свечам ---
     streak = int(_f("liq_filter_impulse", 0))
@@ -2680,8 +3515,14 @@ async def _process_pending_impl(context):
                 pass
 
             if not passed:
+                # Пауза приёма сигналов по монете: отменённый каскад ещё
+                # какое-то время превышает порог в окне агрегации, и без
+                # паузы бот сразу повторно принял бы его как «новый» сигнал.
+                _set_signal_cooldown(symbol)
                 for r in reasons:
-                    if "свеч" in r:
+                    if "хвост" in r:
+                        _bump_stat("liq_stat_filter_tail")
+                    elif "свеч" in r:
                         _bump_stat("liq_stat_filter_impulse")
                     elif "OI" in r:
                         _bump_stat("liq_stat_filter_oi")
@@ -2693,13 +3534,19 @@ async def _process_pending_impl(context):
                     "liq_last_scan",
                     f"[{symbol}] вход отменён фильтром: {reasons[0][:90]}",
                 )
+                cd_sec = get_signal_cooldown_sec()
+                cd_line = (f"\n\n🧊 *Пауза сигналов:* тот же каскад пока в окне "
+                           f"агрегации — повторные сигналы по `{symbol}` не "
+                           f"принимаю ещё *{cd_sec}с*."
+                           if cd_sec > 0 else "")
                 await _send(
                     context, cid,
                     f"🛑 *Вход отменён фильтром* `{symbol}` {outcome}\n"
                     + "\n".join(f"• {md_escape(r)}" for r in reasons)
                     + f"\n\n{md_escape(_filters_detail_line(details))}"
                     + "\n_Движение идёт без откатов — контр-трейд в такие "
-                      "моменты и даёт серии убытков._",
+                      "моменты и даёт серии убытков._"
+                    + cd_line,
                 )
                 continue
             log.info(f"liq: фильтры пройдены {symbol}: {details or 'все выключены'}")
@@ -2854,21 +3701,29 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
     demo = get_setting("demo_mode", "0") == "1"
     is_demo_flag = 1 if demo else 0
 
-    # === Фильтр исполнения: спред и глубина стакана ===
+    # === Фильтр исполнения: спред и глубина стакана (с повторными попытками) ===
+    # Стакан бывает тонким «в моменте» и восстанавливается за секунды —
+    # поэтому делаем до liq_exec_retries попыток с паузой между ними.
     if not demo:
-        exec_ok, exec_reasons, _exec_detail = check_execution(token_id, stake_usd_final)
+        exec_ok, exec_reasons, _exec_detail, exec_attempts = \
+            await check_execution_retrying(token_id, stake_usd_final,
+                                           deadline=win_end)
         if not exec_ok:
-            log.warning(f"liq_strategy: {symbol} вход отменён — стакан: {exec_reasons}")
+            log.warning(f"liq_strategy: {symbol} вход отменён — стакан "
+                        f"({exec_attempts} попыток): {exec_reasons}")
             set_setting(
                 "liq_last_scan",
                 f"[{symbol}] вход отменён: {exec_reasons[0][:90]}",
             )
+            # Пауза сигналов: тот же каскад ещё «светится» в окне агрегации,
+            # без паузы бот тут же пошёл бы на новый круг попыток.
+            _set_signal_cooldown(symbol)
             await _send(
                 context, cid,
                 f"🚫 *Вход пропущен — тонкий стакан* `{symbol}` {outcome}\n"
                 + "\n".join(f"• {md_escape(r)}" for r in exec_reasons)
-                + "\n_Рыночный ордер в таком стакане даёт плохую среднюю цену "
-                  "и слиппедж. Ждём следующий сигнал._",
+                + f"\n_Сделано попыток: {exec_attempts}. Рыночный ордер в таком "
+                  "стакане даёт плохую среднюю цену и слиппедж. Ждём следующий сигнал._",
                 parse_mode="Markdown",
             )
             return
@@ -2960,6 +3815,13 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
 
     window_end = win_end
     start_next = win_start
+    # «Сигнальное» окно — то, в котором прошёл каскад (окно сразу ПЕРЕД
+    # окном входа). Его объём ликвидаций запоминаем: если этот шаг
+    # проиграет, фильтр убыточной свечи сравнит с ним ликвидации
+    # убыточного окна.
+    ref_liq_usd = window_liq_usd(symbol, win_start - dur, win_start)
+    if ref_liq_usd <= 0:
+        ref_liq_usd = float((agg or {}).get("total_usd") or 0)
     # Сохраняем реальное имя события с Polymarket, чтобы статистика потом
     # корректно показывала «Bitcoin Up or Down» / «Ethereum Up or Down» и т.д.
     raw_q = m.get("question") if isinstance(m, dict) else None
@@ -2985,6 +3847,7 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
         "open_ts": now,
         "oi_snapshot": oi_data or {},
         "market_question_raw": raw_q or "",
+        "ref_liq_usd": ref_liq_usd,
     }
     # Доп. защита: перечитываем состояние прямо перед записью — между
     # проверкой и этим моментом были сетевые вызовы, за которые другой
@@ -3011,7 +3874,9 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
         short_c = agg["short_count"]
         dom = agg["dominant"]
         by_ex = agg.get("by_exchange", {})
-        threshold = float(c["liq_threshold_usd"])
+        # Тот порог, по которому сигнал реально прошёл (динамический,
+        # если включён), а не статичный из настроек.
+        threshold = float(agg.get("_threshold_eff") or c["liq_threshold_usd"])
 
         power_bar = make_power_bar(total, threshold)
         ratio = total / threshold if threshold else 0
@@ -3332,6 +4197,172 @@ async def _enter_trade(context, cid, session, c, state, symbol, outcome, agg, ca
                 pass
 
 
+def get_tp_first_config(c: dict) -> tuple[int, int]:
+    """Тейк по первой ставке: (уровень в центах, первые секунд окна).
+
+    0 в любой из величин выключает механику. Действует только для
+    первого шага серии (series == 0).
+    """
+    try:
+        tp = int(float(c.get("liq_tp_first_cents",
+                             DEFAULTS["liq_tp_first_cents"])))
+    except (TypeError, ValueError):
+        tp = 75
+    tp = max(0, min(99, tp))
+    try:
+        sec = int(float(c.get("liq_tp_first_sec",
+                              DEFAULTS["liq_tp_first_sec"])))
+    except (TypeError, ValueError):
+        sec = 30
+    sec = max(0, min(240, sec))
+    return tp, sec
+
+
+def first_take_applicable(c: dict, pos: dict, now: float) -> bool:
+    """Пробовать ли FAK-тейк на этом тике (только первая ставка серии)."""
+    tp, sec = get_tp_first_config(c)
+    if tp <= 0 or sec <= 0:
+        return False
+    if int(pos.get("series", 0) or 0) != 0:
+        return False
+    if pos.get("awaiting_resolution"):
+        return False
+    win_end = pos.get("window_end") or 0
+    if not win_end:
+        return False
+    win_start = pos.get("window_start") or (win_end - 300)
+    elapsed = now - win_start
+    return 0 <= elapsed < sec and now < win_end
+
+
+async def _try_first_take(context, cid, c, state, symbol, pos) -> bool:
+    """FAK-тейк отката по ПЕРВОЙ ставке серии.
+
+    Вызывается в первые секунды окна: если цена нашего исхода дошла до
+    liq_tp_first_cents (и выше цены входа) — продаём доли FAK-ордером,
+    «забираем какой есть коэффициент»: откат после каскада ликвидаций
+    часто сменяется перемётом в другую сторону.
+
+    Возвращает True, если позиция закрыта (цикл завершён).
+    """
+    import polymarket_trading as pt
+
+    tp, sec = get_tp_first_config(c)
+    if tp <= 0 or sec <= 0:
+        return False
+
+    now = time.time()
+    is_demo_flag = pos.get("is_demo", 0)
+    shares = float(pos.get("shares", pos.get("stake") or 0) or 0)
+    entry_cents = int(pos.get("entry_cents") or 0)
+    if shares <= 0:
+        return False
+
+    info = pt.get_event_markets(pos["slug"])
+    if not info or not info.get("markets"):
+        return False
+    m = info["markets"][0]
+    market_question = m.get("question", pos["slug"])
+    price_yes = m.get("price_yes") or 0
+    price_no = m.get("price_no") or 0
+    try:
+        our_price = int(round(float(
+            price_yes if pos["outcome"] == "UP" else price_no)))
+    except (TypeError, ValueError):
+        return False
+
+    # Живой бид из стакана: гамма отстаёт, и демо фиксировало бы тейк по
+    # устаревшей цене (тот же класс фантомов, что кейс XRP 21:10).
+    try:
+        live = pt.get_live_price(pos["token_id"])
+        if live and live.get("bid") is not None:
+            if int(live["bid"]) != our_price:
+                log.info(f"liq: {symbol} первый тейк: живой бид "
+                         f"{int(live['bid'])}¢ (гамма {our_price}¢)")
+            our_price = int(live["bid"])
+    except Exception:
+        pass
+
+    if our_price < tp or our_price <= entry_cents:
+        return False
+
+    reason = f"FAK-тейк в первые {sec}с окна (уровень {tp}¢)"
+
+    if is_demo_flag:
+        # В демо имитируем исполнение FAK по текущей цене рынка.
+        log.info(f"liq: 🎯 {symbol} первый тейк {tp}¢: цена {our_price}¢ — "
+                 f"ДЕМО, закрываю")
+        await _settle_position(context, cid, c, state, symbol, pos, win=True,
+                               close_price=our_price, price_yes=price_yes,
+                               price_no=price_no,
+                               market_question=market_question,
+                               early_exit=True, settle_ts=now, reason=reason)
+        return True
+
+    # РЕАЛ: продаём ВСЕ доли FAK-ордером (что исполнится — то забираем,
+    # остаток убивается).
+    try:
+        res = pt.place_market_order(pos["token_id"], "SELL", shares,
+                                    order_type="FAK")
+    except Exception as e:
+        log.warning(f"liq: {symbol} FAK-тейк исключение: {e}")
+        return False
+
+    ok, why = pt.is_order_accepted(res)
+    try:
+        fill = pt._extract_fill(res, "SELL") or {}
+    except Exception:
+        fill = {}
+    filled = float(fill.get("shares") or 0)
+    if not ok or filled <= 0:
+        log.info(f"liq: {symbol} FAK-тейк не исполнился (цена ушла): {why}")
+        return False
+
+    # Средняя цена исполнения: для SELL биржа сообщает полученные USDC
+    # (takingAmount → fill["cost"]) и исполненные доли.
+    got_usd = float(fill.get("cost") or 0)
+    if got_usd > 0:
+        avg_cents = got_usd / filled * 100.0
+    elif fill.get("price"):
+        avg_cents = float(fill["price"]) * 100.0
+    else:
+        avg_cents = float(our_price)
+    avg_cents_i = max(1, min(100, int(round(avg_cents))))
+
+    leftover = shares - filled
+    if leftover > 0 and leftover * avg_cents_i / 100.0 >= POLY_MIN_NOTIONAL_USD:
+        # FAK исполнился ЧАСТИЧНО и остаток значим: фиксируем частичный
+        # тейк и продолжаем обычную работу уменьшенной позицией.
+        pos["shares"] = round(leftover, 4)
+        pos["first_take_partial"] = round(filled, 4)
+        state.setdefault("positions", {})[symbol] = pos
+        _save_state(state)
+        log.info(f"liq: {symbol} FAK-тейк частичный: {filled:g} из {shares:g} "
+                 f"долей @ ~{avg_cents_i}¢, остаток {leftover:g} дальше")
+        try:
+            await _send(
+                context, cid,
+                f"🎯 *Первый тейк — частичный* `{symbol}` "
+                f"{'🎮 ДЕМО' if is_demo_flag else '💰 РЕАЛ'}\n"
+                f"FAK исполнил *{filled:g}* из {shares:g} долей @ ~{avg_cents_i}¢ "
+                f"(вход {entry_cents}¢)\n"
+                f"Остаток *{leftover:g}* долей продолжает в обычном режиме",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return False
+
+    log.info(f"liq: 🎯 {symbol} первый тейк: FAK исполнен "
+             f"{filled:g} долей @ ~{avg_cents_i}¢ (уровень {tp}¢)")
+    await _settle_position(context, cid, c, state, symbol, pos, win=True,
+                           close_price=avg_cents_i, price_yes=price_yes,
+                           price_no=price_no,
+                           market_question=market_question,
+                           early_exit=True, settle_ts=now, reason=reason)
+    return True
+
+
 async def _check_open_position(context, cid, session, c, state, symbol, pos):
     """Ведение одной открытой позиции.
 
@@ -3381,6 +4412,16 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
         await _resolve_after_window(context, cid, session, c, state, symbol, pos)
         return
 
+    # === ПЕРВАЯ ставка: FAK-тейк отката в первые секунды окна ===
+    # Откат после каскада ликвидаций часто приходит в самом начале окна,
+    # а потом цену может переметнуть. Поэтому первый шаг серии в первые
+    # liq_tp_first_sec секунд пытаемся закрыть по уровню
+    # liq_tp_first_cents FAK-ордером («забрать какой есть коэффициент»).
+    # Не успели — дальше обычный режим ниже по коду.
+    if first_take_applicable(c, pos, now):
+        if await _try_first_take(context, cid, c, state, symbol, pos):
+            return
+
     try:
         tp_cents = int(float(c.get("liq_tp_cents", "90")))
     except Exception:
@@ -3423,6 +4464,25 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
     entry_cents = pos["entry_cents"]
     is_demo_flag = pos.get("is_demo", 0)
     shares = pos.get("shares", pos["stake"])
+
+    # Живая цена из стакана CLOB (best bid — сколько реально дадут за наши
+    # доли при немедленной продаже). Гамма заметно отстаёт от рынка: в
+    # последние секунды окна она может показывать 50-60¢ там, где стакан
+    # уже 10-20¢ (кейс XRP 21:10 27.08.2026 — фантомное «спасение в плюс»
+    # по 52¢, когда реально рынок уже был против нас). Все решения о
+    # выходе (тейк, аварийный выход) принимаем по живому биду; если стакан
+    # недоступен — остаёмся на цене гаммы.
+    live = None
+    try:
+        live = pt.get_live_price(pos["token_id"])
+    except Exception as e:
+        log.debug(f"liq: {symbol} live price error: {e}")
+    if live and live.get("bid") is not None and int(live["bid"]) != int(close_price):
+        log.info(f"liq: {symbol} живой бид {int(live['bid'])}¢ "
+                 f"(гамма показывала {int(close_price)}¢)")
+    if live and live.get("bid") is not None:
+        close_price = int(live["bid"])
+
     tp_hit = close_price >= tp_cents
     in_profit = close_price > entry_cents
     emergency_time = time_left <= new_order_time
@@ -3574,11 +4634,13 @@ async def _check_open_position(context, cid, session, c, state, symbol, pos):
                     f"ордера, продать нельзя"
                 )
 
+        src_note = "живой стакан" if (live and live.get("bid") is not None) else "гамма"
         await _settle_position(context, cid, c, state, symbol, pos, win=False,
                                close_price=salvage_price, price_yes=price_yes,
                                price_no=price_no, market_question=market_question,
                                early_exit=True, settle_ts=now,
-                               reason=f"свеча окна {state_txt} против {pos['outcome']}")
+                               reason=(f"свеча окна {state_txt} против {pos['outcome']} "
+                                       f"(цена {int(salvage_price)}¢ — {src_note})"))
         return
 
     # Не наш сценарий — цена между входом и TP, времени ещё достаточно.
@@ -3611,6 +4673,7 @@ async def _resolve_after_window(context, cid, session, c, state, symbol, pos):
     #    расходятся, и 23.08.2026 это дало фантомный «плюс» по шагу,
     #    который реально рассчитался против нас.
     price_yes = price_no = 0
+    market_resolved = False
     market_question = pos.get("market_question_raw") or pos["slug"]
     try:
         info = pt.get_event_markets(pos["slug"])
@@ -3619,12 +4682,28 @@ async def _resolve_after_window(context, cid, session, c, state, symbol, pos):
             market_question = m.get("question", market_question)
             price_yes = m.get("price_yes") or 0
             price_no = m.get("price_no") or 0
+            market_resolved = bool(m.get("resolved"))
     except Exception as e:
         log.debug(f"resolve price fetch err: {e}")
 
     our_price = price_yes if outcome == "UP" else price_no
-    market_decided = our_price >= 97 or (our_price <= 3 and (price_yes or price_no))
+    # ВАЖНО (фикс фантомных исходов 27.08.2026, кейс SOL 20:30): пока рынок
+    # официально НЕ разрешён (umaResolutionStatus != resolved), его
+    # outcomePrices — это ЖИВАЯ котировка, а не результат. Проигравший исход
+    # может торговаться по 97-99¢ вплоть до момента, когда оракул развернёт
+    # его в 0 (так и было: рынок разрешился против нас через 52с после конца
+    # окна, а старая логика успевала записать «победу» по 99¢). Поэтому
+    # ценовой вердикт принимаем ТОЛЬКО после официального разрешения; до
+    # него — ждём разрешение либо сверяемся со свечой (ниже).
+    market_decided = market_resolved and (
+        our_price >= 97 or (our_price <= 3 and (price_yes or price_no))
+    )
     opposite = "DOWN" if outcome == "UP" else "UP"
+    if (not market_resolved and (our_price >= 97 or our_price <= 3)):
+        log.info(
+            f"liq: {symbol} '{outcome}' торгуется по {our_price}¢, но рынок ещё "
+            f"не разрешён официально — котировке не верим, ждём расчёта"
+        )
 
     # 2. Свеча окна (фолбэк)
     wc = await get_window_candle(session, symbol, tf, window_start, force=True)
@@ -3632,21 +4711,21 @@ async def _resolve_after_window(context, cid, session, c, state, symbol, pos):
 
     try:
         confirm_wait = int(float(get_setting(
-            "liq_market_confirm_wait", DEFAULTS["liq_market_confirm_wait"]) or 120))
+            "liq_market_confirm_wait", DEFAULTS["liq_market_confirm_wait"]) or 300))
     except (TypeError, ValueError):
-        confirm_wait = 120
-    confirm_wait = max(0, min(300, confirm_wait))
+        confirm_wait = 300
+    confirm_wait = max(0, min(600, confirm_wait))
 
     result = None
     source = ""
     note = ""
     if market_decided:
-        # Рынок уже всё решил — его вердикт авторитетен даже против свечи.
+        # Рынок ОФИЦИАЛЬНО разрешён — его вердикт авторитетен даже против свечи.
         result = outcome if our_price >= 97 else opposite
-        source = "цена рынка"
+        source = "официальное разрешение рынка"
         if candle_result and candle_result != result:
             note = (f"⚠️ свеча {candle_result} расходится с рынком ({result}) — "
-                    f"доверяю рынку: он определяет выплату")
+                    f"доверяю официальному расчёту рынка: он определяет выплату")
             log.warning(
                 f"liq: ⚠️ {symbol} свеча {candle_result} ≠ рынок {result} "
                 f"(yes {price_yes}¢ / no {price_no}¢) — беру результат рынка"
@@ -3665,11 +4744,18 @@ async def _resolve_after_window(context, cid, session, c, state, symbol, pos):
             return
         result = candle_result
         source = "свеча окна"
-        note = f"рынок не рассчитался за {confirm_wait}с — результат по свече, сверь с Polymarket"
+        csrc = str((wc or {}).get("src") or "")
+        if csrc.startswith("chainlink"):
+            note = (f"рынок не рассчитался за {confirm_wait}с — результат по "
+                    f"TWAP-свече Chainlink ({csrc}), сверь с Polymarket")
+        else:
+            note = (f"рынок не рассчитался за {confirm_wait}с — результат по ЗАПАСНОЙ свече "
+                    f"{csrc or '?'}: Polymarket считает по Chainlink TWAP, а не по споту, "
+                    f"направление могло разойтись — ОБЯЗАТЕЛЬНО сверь с Polymarket")
     else:
-        # Нет ни расчёта рынка, ни закрытой свечи. Ждём до 3 минут,
-        # потом решаем по цене.
-        if waited < 180:
+        # Нет ни расчёта рынка, ни закрытой свечи. Ждём не меньше
+        # confirm_wait (но хотя бы 3 минуты), потом решаем по цене.
+        if waited < max(180, confirm_wait):
             pos["awaiting_resolution"] = 1
             state["positions"][symbol] = pos
             _save_state(state)
@@ -3874,7 +4960,7 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
             + (f"🧭 {md_escape(reason)}\n" if reason else "")
             +
             f"📊 {stats_after['total']} WR {stats_after['winrate']}% PnL {stats_after['total_pnl']}$\n"
-            + ("⏳ Жду подтверждения следующего окна (свеча/микро-каскад)…\n"
+            + ("⏳ Оцениваю убыточную свечу фильтром хвоста ликвидаций…\n"
                if get_mg_entry_mode() == "signal"
                else "⏳ Сейчас вхожу в следующее окно с увеличенной ставкой…\n")
         )
@@ -3890,54 +4976,162 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     # Так как мы закрываемся в конце текущего окна, текущий
     # boundary уже истёк — следующее окно = (now // 5m + 1) * 5m.
     tf = c["liq_timeframe"]
+    entry_note = ""
+
+    # Объём ликвидаций в УБЫТОЧНОМ окне: это и есть «сигнальное окно»
+    # для СЛЕДУЮЩЕГО шага серии (фильтр убыточной свечи сравнивает
+    # ликвидации убыточного окна с окном, по которому заходили).
+    loss_window_usd = 0.0
+    try:
+        loss_window_usd = window_liq_usd(symbol, pos.get("window_start") or 0,
+                                         pos.get("window_end") or 0)
+    except Exception as e:
+        log.debug(f"liq: {symbol} loss_window_usd err: {e}")
 
     if get_mg_entry_mode() == "signal":
-        # === Режим signal: шаг войдёт ТОЛЬКО при подтверждении окна ===
-        # (живая свеча нового окна в нашу сторону или микро-каскад).
-        # Ждём до liq_mg_skip_windows окон; если подтверждения нет —
-        # вход уменьшенным лотом liq_mg_skip_lot_pct% или остановка серии.
+        # === Режим signal: повторный вход через ФИЛЬТР ХВОСТА ЛИКВИДАЦИЙ ===
+        # Убыточная свеча оценивается по тому же принципу, что и перед
+        # входом: все ликвидации за окно liq_window_sec и доля последних
+        # liq_tail_sec секунд («хвост»).
+        #   • хвост ПРОШЁЛ → входим в окно, следующее СРАЗУ за убыточным,
+        #     БЕЗ ожидания и пропусков;
+        #   • хвост ЗАБЛОКИРОВАН → в следующее окно не входим: ждём, пока
+        #     фильтр хвоста пустит одно из следующих окон (каждое
+        #     проверяется в конце). Убыточное окно считается ПЕРВЫМ
+        #     заблокированным. После liq_mg_skip_windows заблокированных
+        #     окон — вход лотом liq_mg_skip_lot_pct% или остановка серии
+        #     (при 0%).
+        # Плюс ФИЛЬТР ЛИКВИДАЦИЙ УБЫТОЧНОЙ СВЕЧИ: объём ликвидаций
+        # убыточного окна сравнивается с «сигнальным» окном входа
+        # (режим больше/меньше N%) — см. eval_loss_liq_filter.
         try:
-            max_skip = int(float(get_setting("liq_mg_skip_windows",
-                                             DEFAULTS["liq_mg_skip_windows"]) or 0))
-        except (TypeError, ValueError):
-            max_skip = 2
-        max_skip = max(0, min(5, max_skip))
+            tail = eval_tail_filter(symbol)
+        except Exception as e:
+            log.warning(f"liq: {symbol} фильтр хвоста на убыточной свече: {e}")
+            tail = {"enabled": False, "blocked": False,
+                    "why": f"фильтр недоступен ({e})", "tail_sec": 0}
         try:
-            lot_pct = float(get_setting("liq_mg_skip_lot_pct",
-                                        DEFAULTS["liq_mg_skip_lot_pct"]) or 0)
-        except (TypeError, ValueError):
-            lot_pct = 50.0
-        lot_pct = max(0.0, min(100.0, lot_pct))
+            loss_liq = eval_loss_liq_filter(symbol, pos.get("ref_liq_usd"),
+                                            pos.get("window_start") or 0,
+                                            pos.get("window_end") or 0)
+        except Exception as e:
+            log.warning(f"liq: {symbol} фильтр убыточной свечи: {e}")
+            loss_liq = {"enabled": False, "blocked": False,
+                        "why": f"фильтр недоступен ({e})"}
 
-        state = _load_state()
-        state.setdefault("mg_pending", {})[symbol] = {
-            "series": next_series,
-            "outcome": carried_outcome,
-            "max_skip": max_skip,
-            "lot_pct": lot_pct,
-            "skips_used": 0,
-            "checked_window": 0,
-            "created_ts": time.time(),
-            "tf": tf,
-            "cid": cid,
-        }
-        _save_state(state)
+        tail_blocked = bool(tail.get("enabled") and tail.get("blocked"))
+        loss_liq_blocked = bool(loss_liq.get("enabled") and loss_liq.get("blocked"))
+        if loss_liq.get("enabled"):
+            log.info(f"liq: {symbol} фильтр убыточной свечи: {loss_liq.get('why')}")
+        if tail_blocked or loss_liq_blocked:
+            block_parts = []
+            if tail_blocked:
+                block_parts.append(f"хвост: {tail.get('why')}")
+            if loss_liq_blocked:
+                block_parts.append(f"ликвидации убыточной свечи: {loss_liq.get('why')}")
+            tail = dict(tail)
+            tail["why"] = " | ".join(block_parts)
+            try:
+                max_skip = int(float(get_setting("liq_mg_skip_windows",
+                                                 DEFAULTS["liq_mg_skip_windows"]) or 0))
+            except (TypeError, ValueError):
+                max_skip = 2
+            max_skip = max(0, min(5, max_skip))
+            try:
+                lot_pct = float(get_setting("liq_mg_skip_lot_pct",
+                                            DEFAULTS["liq_mg_skip_lot_pct"]) or 0)
+            except (TypeError, ValueError):
+                lot_pct = 50.0
+            lot_pct = max(0.0, min(100.0, lot_pct))
 
-        try:
-            nxt_start, _nxt_end = _window_bounds(tf, settle_ts, offset_windows=1)
-            nxt_str = datetime.fromtimestamp(nxt_start, tz=timezone.utc).strftime("%H:%M:%S UTC")
-            await _send(
-                context, cid,
-                f"👀 *Жду подтверждения* `{symbol}` {carried_outcome}\n"
-                f"Шаг {next_series} войдёт в окно *{nxt_str}*, только если его свеча "
-                f"идёт в нашу сторону или случится микро-каскад в нашу пользу.\n"
-                f"Без подтверждения пропущу до *{max_skip}* окон, затем лот "
-                f"*{lot_pct:g}%* от расчётного (0% = серия останавливается).",
-                parse_mode="Markdown",
-            )
-        except Exception:
-            pass
-        return
+            if max_skip <= 1:
+                # Лимит пропусков исчерпан: убыточное окно — первый блок
+                if lot_pct <= 0:
+                    state = _load_state()
+                    state.setdefault("series", {})[symbol] = 0
+                    state.setdefault("series_pnl", {}).pop(symbol, None)
+                    state.setdefault("mg_pending", {}).pop(symbol, None)
+                    _save_state(state)
+                    log.info(f"liq: 🛑 {symbol} убыточная свеча не прошла фильтр "
+                             f"хвоста, пропусков нет — серия остановлена: {tail['why']}")
+                    try:
+                        await _send(
+                            context, cid,
+                            f"🛑 *Мартингейл остановлен — фильтр убыточной свечи* `{symbol}` {carried_outcome}\n"
+                            f"Убыточная свеча не прошла фильтр: {md_escape(tail['why'])}\n"
+                            f"Пропусков окон нет (лимит 0) — серия остановлена. "
+                            f"Жду новый каскад.",
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+                    return
+                next_stake = round(next_stake * lot_pct / 100.0, 2)
+                entry_note = (f"фильтр убыточной свечи: не прошла, "
+                              f"лимит пропусков исчерпан — лот {lot_pct:g}%")
+                log.info(f"liq: ⚠️ {symbol} убыточная свеча не прошла фильтр хвоста "
+                         f"({tail['why']}), лимит пропусков исчерпан — вход лотом "
+                         f"{next_stake}$ ({lot_pct:g}%)")
+                try:
+                    await _send(
+                        context, cid,
+                        f"⚠️ *Фильтр хвоста: лимит пропусков исчерпан* `{symbol}` {carried_outcome}\n"
+                        f"Убыточная свеча не прошла фильтр: {md_escape(tail['why'])}\n"
+                        f"Пропускать окна некуда — вхожу в следующее окно лотом "
+                        f"*{next_stake}$* ({lot_pct:g}% от расчётного).",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+            else:
+                # Убыточное окно заблокировано (первый пропуск) — ждём,
+                # пока фильтр хвоста пустит одно из следующих окон.
+                state = _load_state()
+                state.setdefault("mg_pending", {})[symbol] = {
+                    "series": next_series,
+                    "outcome": carried_outcome,
+                    "max_skip": max_skip,
+                    "lot_pct": lot_pct,
+                    "skips_used": 1,  # убыточное окно = первый блок
+                    "checked_window": 0,
+                    "created_ts": time.time(),
+                    "tf": tf,
+                    "cid": cid,
+                }
+                _save_state(state)
+                log.info(f"liq: 👀 {symbol} убыточная свеча не прошла фильтр хвоста "
+                         f"({tail['why']}) — окно после убытка пропускаю, жду "
+                         f"прохождения фильтра (1/{max_skip})")
+                try:
+                    await _send(
+                        context, cid,
+                        f"👀 *Убыточная свеча не прошла фильтр* `{symbol}` {carried_outcome}\n"
+                        f"{md_escape(tail['why'])}\n"
+                        f"Окно сразу после убытка пропускаю. Жду, когда фильтр "
+                        f"хвоста пустит одно из следующих окон (пропусков "
+                        f"*1/{max_skip}*); после лимита — лот *{lot_pct:g}%* "
+                        f"от расчётного (0% = серия останавливается).",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+                return
+        else:
+            # Хвост прошёл (или фильтр выключен) — входим в следующее окно
+            # СРАЗУ, не пропуская шагов.
+            entry_note = f"фильтры убыточной свечи: прошла ({tail['why']})"
+            log.info(f"liq: ✅ {symbol} убыточная свеча прошла фильтр хвоста "
+                     f"({tail['why']}) — вхожу в следующее окно без пропусков")
+            try:
+                await _send(
+                    context, cid,
+                    f"✅ *Убыточная свеча прошла фильтры убыточной свечи* `{symbol}` {carried_outcome}\n"
+                    f"{md_escape(tail['why'])}\n"
+                    f"Вхожу в следующее окно без пропусков.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
 
     next_offset = pick_entry_window(tf, settle_ts)
     next_window_start, next_window_end = _window_bounds(tf, settle_ts, offset_windows=next_offset)
@@ -3951,7 +5145,9 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     try:
         await _enter_martingale_step(context, cid, c, state, symbol,
                                      next_stake, next_series, tf,
-                                     carried_outcome=carried_outcome)
+                                     carried_outcome=carried_outcome,
+                                     entry_note=entry_note,
+                                     ref_liq_usd=loss_window_usd)
     except Exception as e:
         log.exception(f"martingale step enter err: {e}")
         try:
@@ -3965,7 +5161,8 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
 
 async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, series, tf,
                                  carried_outcome: str | None = None,
-                                 entry_note: str = ""):
+                                 entry_note: str = "",
+                                 ref_liq_usd: float | None = None):
     """Вход в следующее окно с увеличенной ставкой. Вызывается
     планировщиком мартингейла: в режиме timer — сразу после проигранного
     шага, в режиме signal — после подтверждения нового окна.
@@ -3980,6 +5177,11 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
 
     entry_note: пояснение, ПОЧЕМУ вошли именно сейчас (подтверждение
     свечи/каскада, вход после пропусков) — попадает в сообщение.
+
+    ref_liq_usd: объём ликвидаций в окне-триггере этого входа (для шага
+    после убытка — убыточное окно, после пропусков — окно, прошедшее
+    фильтр). Нужен фильтру ликвидаций убыточной свечи на случай, если
+    этот шаг проиграет.
     """
     import polymarket_trading as pt
 
@@ -4113,20 +5315,35 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
     demo = get_setting("demo_mode", "0") == "1"
     is_demo_flag = 1 if demo else 0
 
-    # === Фильтр исполнения: спред и глубина стакана ===
+    # === Фильтр исполнения: спред и глубина стакана (с повторными попытками) ===
     if not demo:
-        exec_ok, exec_reasons, _exec_detail = check_execution(token_id, stake_usd_final)
+        exec_ok, exec_reasons, _exec_detail, exec_attempts = \
+            await check_execution_retrying(token_id, stake_usd_final,
+                                           deadline=window_end)
         if not exec_ok:
-            log.warning(f"liq: мартингейл {symbol} шаг {series} — стакан: {exec_reasons}")
-            state["series"][symbol] = 0
-            state.setdefault("series_pnl", {}).pop(symbol, None)
-            _save_state(state)
+            # ВАЖНО: серию НЕ останавливаем и НЕ сбрасываем. Стакан был
+            # тонким в моменте — вход просто не получился. Долг серии и
+            # шаг сохраняются: следующий сигнал по этой монете зайдёт тем
+            # же лотом, который должен был войти сейчас.
+            debt = abs(get_series_pnl(state, symbol))
+            log.warning(f"liq: мартингейл {symbol} шаг {series} — стакан не пустил "
+                        f"({exec_attempts} попыток): {exec_reasons}. Серия сохранена, "
+                        f"ждём следующий сигнал с лотом ${stake_usd:.2f}")
+            set_setting(
+                "liq_last_scan",
+                f"[{symbol}] шаг {series} не вошёл (стакан), серия ждёт сигнал",
+            )
+            # Пауза сигналов: тот же каскад ещё «светится» в окне агрегации,
+            # без паузы бот тут же пошёл бы на новый круг попыток.
+            _set_signal_cooldown(symbol)
             await _send(
                 context, cid,
-                f"🛑 *Мартингейл остановлен — тонкий стакан* `{symbol}` (шаг {series})\n"
+                f"🛑 *Вход не получился — тонкий стакан* `{symbol}` (шаг {series})\n"
                 + "\n".join(f"• {md_escape(r)}" for r in exec_reasons)
-                + "\n_Рыночный ордер в таком стакане даёт плохую среднюю цену "
-                  "и слиппедж. Ждём новый сигнал._",
+                + f"\n_Сделано попыток: {exec_attempts}. Рыночный ордер в таком "
+                  "стакане даёт плохую среднюю цену и слиппедж._\n"
+                  f"♻️ *Серия НЕ остановлена*: жду следующий сигнал по монете — "
+                  f"вход тем же лотом *${stake_usd:.2f}* (долг серии ${debt:.2f}).",
                 parse_mode="Markdown",
             )
             return
@@ -4226,6 +5443,9 @@ async def _enter_martingale_step(context, cid, c, state, symbol, stake_usd, seri
         "agg_snapshot": agg, "candle": candle, "symbol": symbol,
         "open_ts": now, "oi_snapshot": {},
         "market_question_raw": raw_q or "",
+        # Объём ликвидаций окна-триггера: нужен фильтру убыточной свечи,
+        # если этот шаг проиграет.
+        "ref_liq_usd": float(ref_liq_usd or 0),
     }
     state = _load_state()
     if symbol in (state.get("positions") or {}):

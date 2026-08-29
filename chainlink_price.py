@@ -1,10 +1,19 @@
 """Цена BTC/ETH/… из того же источника, по которому считает Polymarket.
 
 Polymarket Up/Down рассчитывается НЕ по споту биржи, а по Chainlink
-Data Streams (страница data.chain.link/streams/btc-usd). С 7 августа 2026
-это TWAP-поток: у 5-минутных рынков окно усреднения 30 секунд, у 15m и 4h —
-60 секунд. Именно поэтому спот Gate.io иногда показывает дожи там, где на
-Polymarket две явные красные свечи.
+Data Streams (например, data.chain.link/streams/btc-usd-twap-60s-streams):
+рынок резолвится «Up», если финальный TWAP (окно усреднения 60 секунд)
+больше либо равен «цене начала» окна.
+
+ВАЖНО про окно усреднения: по состоянию на 27.08.2026 ВСЕ действующие
+рынки серий *-up-or-down-* (5m, 15m, 1h; btc/eth/sol/xrp/…) имеют конфиг
+вида «*-5m-twap-60» с twapLookbackSeconds=60, т.е. считаются по
+60-секундному TWAP-потоку. До этого 5-минутки какое-то время жили на
+30-секундном потоке — если свеча бота вдруг станет расходиться с
+официальным исходом, первым делом проверить конфиг рынка (поле
+cryptoMarketConfig.twapLookbackSeconds в gamma-api). Именно из-за разницы
+источников спот Gate.io иногда показывает дожи там, где на Polymarket две
+явные красные свечи (и наоборот).
 
 Забирать данные можно двумя путями:
   • напрямую у Chainlink Data Streams — нужны API-ключи (client id/secret);
@@ -36,8 +45,14 @@ TOPIC_BY_WINDOW = {
 }
 
 # Окно усреднения TWAP, которое Polymarket применяет к своим рынкам.
+# Проверено по конфигам рынков в gamma-api (поле
+# cryptoMarketConfig.twapLookbackSeconds) 27.08.2026:
+#   btc/eth/sol-5m-twap-60, btc-15m-twap-60 → все по 60 секунд.
+# Раньше 5m-рынки сидели на 30-секундном потоке; если исходы начнут
+# расходиться со свечой бота — первым делом сверить twapLookbackSeconds
+# актуального рынка и эту таблицу.
 TWAP_WINDOW_BY_TF = {
-    "5m": 30,
+    "5m": 60,
     "15m": 60,
     "1h": 60,
 }
@@ -72,7 +87,9 @@ def to_rtds_symbol(symbol: str) -> str:
 
 
 def twap_window_for(timeframe: str) -> int:
-    return TWAP_WINDOW_BY_TF.get(timeframe, 30)
+    # Незнакомый таймфрейм → 60с: сейчас все действующие рынки
+    # Up/Down считаются именно по 60-секундному TWAP.
+    return TWAP_WINDOW_BY_TF.get(timeframe, 60)
 
 
 def _store(symbol_norm: str, window_s: int, ts: float, price: float):
