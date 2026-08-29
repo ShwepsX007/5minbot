@@ -802,7 +802,7 @@ def strat_menu_kb():
         [Btn(f"{'🟢 Работает — нажмите чтобы остановить' if active else '🔴 Остановлена — нажмите чтобы запустить'}", callback_data="liq_toggle")],
         [Btn("📊 Статус", callback_data="liq_status"), Btn("⚙️ Настройки", callback_data="liq_settings")],
         [Btn("🔄 Сбросить серии", callback_data="liq_reset")],
-        [Btn("⬅️ Назад", callback_data="back_main")],
+        [Btn("⬅️ К выбору стратегий", callback_data="strat_menu")],
     ])
 
 

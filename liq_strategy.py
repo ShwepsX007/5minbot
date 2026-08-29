@@ -1504,12 +1504,20 @@ def _get_trade_stats(is_demo: int):
     except Exception:
         trades = []
     # Фильтр по slug: наши окна имеют вид "<asset>-updown-<tf>-<ts>".
-    # Слагов других стратегий этот шаблон не имеют.
+    # Сделки второй стратегии («Движение за рынком») тоже ходят в
+    # updown-окнах, но помечены strategy='trend' — их исключаем, чтобы
+    # статистика систем не пересекалась.
     def _is_liq(t):
         slug = str(t.get("slug", "") or "")
+        strat = str(t.get("strategy", "") or "").strip().lower()
+        if strat == "trend":
+            return False
         return "-updown-" in slug
     strat_trades = [t for t in trades if _is_liq(t)]
-    use = strat_trades if strat_trades else trades
+    # Фолбэк для старых данных — но сделки второй стратегии в него
+    # попадать не должны ни при каких условиях.
+    use = strat_trades or [t for t in trades
+                           if str(t.get("strategy") or "").strip().lower() != "trend"]
     if not use:
         return {
             "total": 0, "wins": 0, "losses": 0, "winrate": 0,
@@ -4837,7 +4845,8 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
         else:
             pnl = 0
         add_trade_history(is_demo_flag, slug, trade_question, outcome, "BUY",
-                          pos.get("shares", stake), entry_cents, close_price, pnl)
+                          pos.get("shares", stake), entry_cents, close_price, pnl,
+                          strategy="liquidations")
         series_total = round(prev_series_pnl + pnl, 2)
         series_map[symbol] = 0
         pnl_map.pop(symbol, None)
@@ -4872,7 +4881,8 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     recovered = round(shares_cnt * (max(0, close_price) / 100.0), 2)
     pnl = round(recovered - stake, 2)
     add_trade_history(is_demo_flag, slug, trade_question, outcome, "BUY",
-                      shares_cnt, entry_cents, close_price, pnl)
+                      shares_cnt, entry_cents, close_price, pnl,
+                      strategy="liquidations")
 
     # Накопленный результат серии с учётом этой сделки. Досрочный выход по
     # свече часто закрывается не в ноль, поэтому долг серии — это НЕ сумма
