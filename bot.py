@@ -13,6 +13,8 @@ from database import *
 from utils import fetch_market, build_trend, threshold_exceeded, generate_plot, generate_pnl_plot, calc_pnl_curve
 import liq_strategy as ls
 import liq_menu
+import trend_strategy as ts
+import trend_menu as tmenu
 from config import BASE_DIR, ADMIN_CHAT_IDS
 
 log = logging.getLogger("bot")
@@ -108,6 +110,21 @@ def mk_kb():
         back("back_main")
     ])
 
+def strategies_kb():
+    """Экран выбора торговой системы: две независимые стратегии.
+
+    Кнопки показывают вкл/выкл каждой системы, но не управляют ей —
+    включается уже внутри панели каждой стратегии (своим тумблером).
+    """
+    liq = ls.is_active()
+    trend = ts.is_active()
+    return KB([
+        [Btn(f"🌊 Каскад ликвидаций {'— 🟢' if liq else '— 🔴'}", callback_data="strat_liquidations")],
+        [Btn(f"🕯 Движение за рынком {'— 🟢' if trend else '— 🔴'}", callback_data="strat_trend")],
+        back("back_main"),
+    ])
+
+
 def trade_kb():
     demo = get_setting("demo_mode", "0") == "1"
     return KB([
@@ -189,13 +206,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🤖 Стратегии":
             s["state"] = None
             s.pop("liq_edit_key", None)
-            txt = ls.get_status_text()
-            if len(txt) > 3800:
-                txt = txt[:3800] + "\n\n_...обрезано_"
-            return await md_reply(
-                update.message, "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt,
-                reply_markup=liq_menu.strat_menu_kb()
-            )
+            return await update.message.reply_text(
+                "🤖 *АЛГОТОРГОВЛЯ* — выберите торговую систему:\n\n"
+                "🌊 *Каскад ликвидаций* — контр-трейд на каскаде ликвидаций\n"
+                "🕯 *Движение за рынком* — вход по направлению последней свечи, мартингейл\n\n"
+                "_Системы полностью независимы: свои настройки, свои серии, своя статистика._",
+                parse_mode="Markdown", reply_markup=strategies_kb())
 
         if text == "⚙️ Настройки":
             s["state"] = None
@@ -244,6 +260,31 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "⚙️ *Настройки стратегии «Ликвидации»*",
                     parse_mode="Markdown",
                     reply_markup=liq_menu.settings_kb()
+                )
+
+        # --- Ручной ввод настроек стратегии «Движение за рынком» ---
+        if state == "wait_trend_manual":
+            main_btns = {"💰 Торговля", "📊 Рынки", "📈 Графики", "🤖 Стратегии", "⚙️ Настройки", "🔔 Уведомления"}
+            if text not in main_btns:
+                key = s.get("trend_edit_key")
+                if not key:
+                    s["state"] = None
+                    return await update.message.reply_text("⚠️ Неизвестный параметр, ввод отменён.", reply_markup=tmenu.settings_kb())
+                ok, norm, err = tmenu.validate_manual_input(key, text)
+                if not ok:
+                    return await update.message.reply_text(
+                        f"{err}\n\n{tmenu.TREND_PARAM_META.get(key, {}).get('hint', '')}\n\nПопробуй ещё раз.",
+                        reply_markup=KB([[Btn("⬅️ Назад", callback_data=f"tqp_{key}")]])
+                    )
+                ts.set_param(key, norm)
+                s["state"] = None
+                s.pop("trend_edit_key", None)
+                if key in ("td_check_interval", "td_scan_interval"):
+                    schedule_jobs(context, cid)
+                await update.message.reply_text(f"✅ Сохранено: `{key}` = *{norm}*", parse_mode="Markdown")
+                return await update.message.reply_text(
+                    "⚙️ *Настройки стратегии «Движение за рынком»*",
+                    parse_mode="Markdown", reply_markup=tmenu.settings_kb()
                 )
 
         # ==================== ОРДЕРА (ОСТАЛОСЬ БЕЗ ИЗМЕНЕНИЙ) ====================
@@ -379,6 +420,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 back("back_main")
             ]))
 
+        # === ВЫБОР ТОРГОВОЙ СИСТЕМЫ ===
+        if d == "strat_menu":
+            s["state"] = None
+            s.pop("liq_edit_key", None)
+            s.pop("trend_edit_key", None)
+            return await md_edit(
+                q,
+                "🤖 *АЛГОТОРГОВЛЯ* — выберите торговую систему:\n\n"
+                "🌊 *Каскад ликвидаций* — контр-трейд на каскаде ликвидаций\n"
+                "🕯 *Движение за рынком* — вход по направлению последней свечи, мартингейл\n\n"
+                "_Системы полностью независимы: свои настройки, свои серии, своя статистика._",
+                reply_markup=strategies_kb(),
+            )
+
         # === СТРАТЕГИЯ "ЛИКВИДАЦИИ" ===
         if d == "strat_liquidations":
             s["state"] = None
@@ -388,6 +443,154 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(txt) > 3800:
                 txt = txt[:3800] + "\n\n_...обрезано, полный статус в логах_"
             return await md_edit(q, "🤖 *АЛГОТОРГОВЛЯ*\n\n" + txt, reply_markup=liq_menu.strat_menu_kb())
+
+        # === СТРАТЕГИЯ "ДВИЖЕНИЕ ЗА РЫНКОМ" (вторая, независимая) ===
+        if d == "strat_trend":
+            s["state"] = None
+            s.pop("trend_edit_key", None)
+            txt = ts.get_status_text()
+            if len(txt) > 3800:
+                txt = txt[:3800] + "\n\n_...обрезано, полный статус в логах_"
+            return await md_edit(q, "🕯 *ДВИЖЕНИЕ ЗА РЫНКОМ*\n\n" + txt,
+                                 reply_markup=tmenu.strat_menu_kb())
+
+        if d == "td_toggle":
+            s["state"] = None
+            s.pop("trend_edit_key", None)
+            ts.set_active(not ts.is_active())
+            schedule_jobs(context, cid)  # джобы стратегий перевесить (интервалы могли меняться)
+            txt = ts.get_status_text()
+            if len(txt) > 3800:
+                txt = txt[:3800] + "\n\n_...обрезано_"
+            return await md_edit(q, "🕯 *ДВИЖЕНИЕ ЗА РЫНКОМ*\n\n" + txt,
+                                 reply_markup=tmenu.strat_menu_kb())
+
+        if d == "td_status":
+            s["state"] = None
+            s.pop("trend_edit_key", None)
+            txt = ts.get_status_text()
+            if len(txt) > 3800:
+                txt = txt[:3800] + "\n\n_...обрезано_"
+            return await md_reply(q.message, "🕯 *ДВИЖЕНИЕ ЗА РЫНКОМ*\n\n" + txt,
+                                  reply_markup=tmenu.strat_menu_kb())
+
+        if d == "td_reset":
+            s["state"] = None
+            s.pop("trend_edit_key", None)
+            ts.reset_state()
+            txt = ts.get_status_text()
+            if len(txt) > 3800:
+                txt = txt[:3800] + "\n\n_...обрезано_"
+            return await md_edit(q, "✅ Серии и позиции второй стратегии сброшены.\n\n" + txt,
+                                 reply_markup=tmenu.strat_menu_kb())
+
+        if d == "td_stats":
+            s["state"] = None
+            s.pop("trend_edit_key", None)
+            txt = ts.get_stats_text()
+            if len(txt) > 3800:
+                txt = txt[:3800] + "\n\n_...обрезано_"
+            return await md_edit(q, txt, reply_markup=KB([
+                [Btn("📈 График PnL (2-я стратегия)", callback_data="td_stats_chart")],
+                [Btn("🗑 Очистить статистику 2-й стратегии", callback_data="td_stats_clear")],
+                [Btn("⬅️ К стратегии", callback_data="strat_trend")],
+            ]))
+
+        if d == "td_stats_chart":
+            demo = get_setting("demo_mode", "0") == "1"
+            trades = get_trade_statistics(1 if demo else 0, strategy="trend")
+            if not trades:
+                return await q.answer("Статистика 2-й стратегии пуста.", show_alert=True)
+            buf = generate_pnl_plot(trades, is_demo=demo)
+            if not buf:
+                return await q.answer("Недостаточно данных для графика.", show_alert=True)
+            curve = calc_pnl_curve(trades)
+            caption = (f"📈 PnL — 🕯 «Движение за рынком» ({'🎮 ДЕМО' if demo else '💰 РЕАЛ'})\n"
+                       f"Сделок: {curve['count']} | В плюс: {curve['wins']} | В минус: {curve['losses']}\n"
+                       f"Итого: {'+' if curve['total_pnl'] >= 0 else ''}{curve['total_pnl']}$ | "
+                       f"Макс. просадка: {round(curve['max_drawdown'], 2)}$")
+            await q.message.reply_photo(photo=buf, caption=caption)
+            return
+
+        if d == "td_stats_clear":
+            demo = get_setting("demo_mode", "0") == "1"
+            ts.clear_stats(1 if demo else 0)
+            return await md_edit(q, "✅ Статистика «Движения за рынком» очищена "
+                                   "(статистика 1-й стратегии не тронута).",
+                                 reply_markup=tmenu.strat_menu_kb())
+
+        if d == "td_settings":
+            s["state"] = None
+            s.pop("trend_edit_key", None)
+            return await q.edit_message_text("⚙️ *Настройки стратегии «Движение за рынком»*",
+                                             parse_mode="Markdown", reply_markup=tmenu.settings_kb())
+
+        if d == "tqp_td_symbols":
+            s["state"] = None
+            s.pop("trend_edit_key", None)
+            return await q.edit_message_text(
+                tmenu.pairs_view_text(), parse_mode="Markdown",
+                reply_markup=KB(tmenu.pairs_kb()))
+
+        if d.startswith("td_tog_pair:"):
+            sym = d[len("td_tog_pair:"):].strip().upper()
+            current = ts.get_selected_symbols()
+            if sym in current:
+                new_list = [x for x in current if x != sym]
+            else:
+                new_list = list(current) + [sym]
+            ts.set_selected_symbols(new_list)
+            return await q.edit_message_text(
+                tmenu.pairs_view_text(), parse_mode="Markdown",
+                reply_markup=KB(tmenu.pairs_kb()))
+
+        if d == "td_pairs_all":
+            ts.set_selected_symbols(list(ls.AVAILABLE_SYMBOLS))
+            return await q.edit_message_text(
+                tmenu.pairs_view_text(), parse_mode="Markdown",
+                reply_markup=KB(tmenu.pairs_kb()))
+
+        if d == "td_pairs_none":
+            ts.set_selected_symbols([])
+            return await q.edit_message_text(
+                tmenu.pairs_view_text(), parse_mode="Markdown",
+                reply_markup=KB(tmenu.pairs_kb()))
+
+        if d.startswith("tqp_"):
+            key = d[4:]
+            s["state"] = None
+            s.pop("trend_edit_key", None)
+            rows, label = tmenu.param_value_kb(key)
+            cur = ts.get_param(key)
+            cur_pretty = tmenu._PRETTY.get(str(cur), str(cur))
+            hint = tmenu.TREND_PARAM_META.get(key, {}).get("hint", "")
+            text = (f"⚙️ {label} — текущее: *{tmenu._escape_md(cur_pretty)}*\n\n{tmenu._escape_md(hint)}"
+                    if hint else f"⚙️ {label} — выберите значение:")
+            return await q.edit_message_text(text, parse_mode="Markdown", reply_markup=KB(rows))
+
+        if d.startswith("tqm_"):
+            key = d[4:]
+            s["state"] = "wait_trend_manual"
+            s["trend_edit_key"] = key
+            return await q.edit_message_text(
+                tmenu.get_manual_prompt(key), parse_mode="Markdown",
+                reply_markup=KB([
+                    [Btn("⬅️ Назад", callback_data=f"tqp_{key}")],
+                    [Btn("⬅️ К настройкам", callback_data="td_settings")]
+                ]))
+
+        if d.startswith("tqv:"):
+            _, pidx_s, vidx_s = d.split(":")
+            pidx, vidx = int(pidx_s), int(vidx_s)
+            key, _, options = tmenu.PARAMS[pidx]
+            value = options[vidx]
+            ts.set_param(key, value)
+            s["state"] = None
+            s.pop("trend_edit_key", None)
+            if key in ("td_check_interval", "td_scan_interval"):
+                schedule_jobs(context, cid)
+            return await q.edit_message_text("⚙️ *Настройки стратегии «Движение за рынком»*",
+                                             parse_mode="Markdown", reply_markup=tmenu.settings_kb())
 
         if d == "liq_toggle":
             s["state"] = None
@@ -701,35 +904,55 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb.append(back("tr_back"))
             return await q.edit_message_text(msg[:4000], parse_mode="Markdown", reply_markup=KB(kb))
 
-        if d == "tr_stats":
+        # === СТАТИСТИКА: вкладки «Все / Ликвидации / За рынком» ===
+        # Сделки каждой автономной системы помечены в БД (trade_history.strategy),
+        # поэтому вкладки не пересекаются: у каждой — свой PnL, WR и список.
+        if d == "tr_stats" or d.startswith("tr_stats_tab_"):
+            tab = d[len("tr_stats_tab_"):] if d.startswith("tr_stats_tab_") else s.get("stats_tab", "all")
+            if tab not in ("all", "liq", "trend"):
+                tab = "all"
+            s["stats_tab"] = tab
+            strat = {"all": None, "liq": "liquidations", "trend": "trend"}[tab]
+            tab_name = {"all": "🧩 Все системы", "liq": "🌊 Ликвидации", "trend": "🕯 Движение за рынком"}[tab]
             demo = get_setting("demo_mode", "0") == "1"
-            trades = get_trade_statistics(1 if demo else 0)
+            is_demo_int = 1 if demo else 0
+            trades = get_trade_statistics(is_demo_int, strategy=strat)
+            tab_row = [Btn("🧩 Все", callback_data="tr_stats_tab_all"),
+                       Btn("🌊 Ликвидации", callback_data="tr_stats_tab_liq"),
+                       Btn("🕯 За рынком", callback_data="tr_stats_tab_trend")]
             if not trades:
-                return await q.edit_message_text(f"📊 Статистика пуста ({'ДЕМО' if demo else 'РЕАЛ'}).", reply_markup=KB([back("tr_back")]))
+                hint = "" if tab == "all" else "\n(этот раздел заполняется только авто-сделками соответствующей стратегии)"
+                return await q.edit_message_text(f"📊 Статистика пуста ({'ДЕМО' if demo else 'РЕАЛ'}).\nВкладка: {tab_name}{hint}",
+                                                 reply_markup=KB([tab_row, back("tr_back")]))
             count = int(get_setting("stats_count", "10"))
             total_pnl = round(sum(t["pnl"] for t in trades), 2)
             wins = sum(1 for t in trades if t["pnl"] > 0)
-            msg = (f"📊 *Статистика ({'🎮 ДЕМО' if demo else '💰 РЕАЛ'})*\n\n"
+            msg = (f"📊 *Статистика ({'🎮 ДЕМО' if demo else '💰 РЕАЛ'})*\n"
+                   f"Вкладка: *{tab_name}*\n\n"
                    f"Всего сделок: *{len(trades)}*\nВ плюс: *{wins}* | В минус: *{len(trades) - wins}*\n"
                    f"Суммарный PnL: *{'+' if total_pnl >= 0 else ''}{total_pnl}$*\n\n"
                    f"*Последние сделки (до {count}):*\n")
             for t in trades[:count]:
                 msg += f"{'🟢' if t['pnl'] >= 0 else '🔴'} {t['question'][:30]} | {t['side']} {t['outcome']} | {'+' if t['pnl']>=0 else ''}{t['pnl']}$\n"
             return await q.edit_message_text(msg[:4000], parse_mode="Markdown", reply_markup=KB([
+                tab_row,
                 [Btn("📈 График PnL", callback_data="tr_stats_chart")],
                 [Btn("🗑 Очистить статистику", callback_data="tr_stats_clear")], back("tr_back")
             ]))
 
         if d == "tr_stats_chart":
+            tab = s.get("stats_tab", "all")
+            strat = {"all": None, "liq": "liquidations", "trend": "trend"}.get(tab)
+            tab_name = {"all": "Все системы", "liq": "🌊 Ликвидации", "trend": "🕯 Движение за рынком"}.get(tab, "Все системы")
             demo = get_setting("demo_mode", "0") == "1"
-            trades = get_trade_statistics(1 if demo else 0)
+            trades = get_trade_statistics(1 if demo else 0, strategy=strat)
             if not trades:
-                return await q.answer("Статистика пуста, графику не из чего строиться.", show_alert=True)
+                return await q.answer("Статистика на этой вкладке пуста, графику не из чего строиться.", show_alert=True)
             buf = generate_pnl_plot(trades, is_demo=demo)
             if not buf:
                 return await q.answer("Недостаточно данных для графика.", show_alert=True)
             curve = calc_pnl_curve(trades)
-            caption = (f"📈 PnL — {'🎮 ДЕМО' if demo else '💰 РЕАЛ'}\n"
+            caption = (f"📈 PnL — {tab_name} | {'🎮 ДЕМО' if demo else '💰 РЕАЛ'}\n"
                        f"Сделок: {curve['count']} | В плюс: {curve['wins']} | В минус: {curve['losses']}\n"
                        f"Итого: {'+' if curve['total_pnl'] >= 0 else ''}{curve['total_pnl']}$ | "
                        f"Макс. просадка: {round(curve['max_drawdown'], 2)}$")
@@ -737,8 +960,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if d == "tr_stats_clear":
-            clear_trade_statistics(1 if get_setting("demo_mode", "0") == "1" else 0)
-            return await q.edit_message_text("✅ Статистика очищена.", reply_markup=KB([back("tr_back")]))
+            tab = s.get("stats_tab", "all")
+            strat = {"all": None, "liq": "liquidations", "trend": "trend"}.get(tab)
+            clear_trade_statistics(1 if get_setting("demo_mode", "0") == "1" else 0, strategy=strat)
+            tab_name = {"all": "всех систем", "liq": "стратегии «Ликвидации»", "trend": "стратегии «Движение за рынком»"}.get(tab, "всех систем")
+            return await q.edit_message_text(f"✅ Статистика {tab_name} очищена.", reply_markup=KB([back("tr_back")]))
 
         if d == "sys_logs":
             log_path = os.path.join(BASE_DIR, "bot.log")
@@ -908,12 +1134,29 @@ async def job_liq_position(context: ContextTypes.DEFAULT_TYPE):
         log.exception(f"job_liq_position error: {e}")
 
 
-# Фоновые задачи ГЛОБАЛЬНЫЕ: стратегия одна на весь бот (состояние лежит в
-# БД), поэтому и сканеров должно быть по одному. Раньше имена содержали
-# chat_id, и при нескольких админах (или /start в личке и в группе) на одну
-# стратегию работало несколько копий джобов — отсюда дубли сообщений,
-# двойные входы и «серия закрыта» одновременно с «шаг проигран».
-STRATEGY_JOB_NAMES = ("mk_job", "liq_signal_job", "liq_position_job")
+async def job_trend_signal(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await ts.scan_for_signal(context)
+    except Exception as e:
+        log.exception(f"job_trend_signal error: {e}")
+
+
+async def job_trend_position(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await ts.scan_open_position(context)
+    except Exception as e:
+        log.exception(f"job_trend_position error: {e}")
+
+
+# Фоновые задачи ГЛОБАЛЬНЫЕ: каждая стратегия одна на весь бот (состояние
+# лежит в БД), поэтому и сканеров должно быть по одному на стратегию.
+# Раньше имена содержали chat_id, и при нескольких админах (или /start в
+# личке и в группе) на одну стратегию работало несколько копий джобов —
+# отсюда дубли сообщений, двойные входы и «серия закрыта» одновременно с
+# «шаг проигран». У «Движения за рынком» СВОИ задачи: оно не зависит от
+# интервалов и состояния стратегии ликвидаций.
+STRATEGY_JOB_NAMES = ("mk_job", "liq_signal_job", "liq_position_job",
+                      "trend_signal_job", "trend_position_job")
 
 
 def _remove_strategy_jobs(jq):
@@ -952,3 +1195,10 @@ def schedule_jobs(context, cid=None):
     li_scan = int(float(get_setting("liq_scan_interval", ls.DEFAULTS["liq_scan_interval"])))
     jq.run_repeating(job_liq_signal, interval=max(li_check, 1), first=5, name=names[1], data={"cid": cid})
     jq.run_repeating(job_liq_position, interval=max(li_scan, 1), first=5, name=names[2], data={"cid": cid})
+
+    # «Движение за рынком» — вторая, полностью независимая система:
+    # свой тик входа (по границам окон) и свой тик ведения позиции/TP.
+    td_check = int(float(get_setting("td_check_interval", ts.DEFAULTS["td_check_interval"])))
+    td_scan = int(float(get_setting("td_scan_interval", ts.DEFAULTS["td_scan_interval"])))
+    jq.run_repeating(job_trend_signal, interval=max(td_check, 1), first=7, name=names[3], data={"cid": cid})
+    jq.run_repeating(job_trend_position, interval=max(td_scan, 1), first=7, name=names[4], data={"cid": cid})

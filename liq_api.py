@@ -1233,6 +1233,59 @@ def ensure_symbol(symbol: str):
         _bybit_desired_symbols.add(bybit_sym)
 
 
+async def recent_liquidations(symbol: str, min_usd: float = 1000.0,
+                              since: float = 0.0) -> list:
+    """Последние ликвидации монеты напрямую из WS-буферов (Bybit/Binance/Gate).
+
+    В отличие от get_all_liquidations() НИКАКИХ курсоров `_last_seen` не
+    двигает: читать можно из второй стратегии, не «съедая» новые события
+    сканеру «Каскада ликвидаций». Буферы живут 600с — ровно два окна по
+    5 минут, этого хватает для сравнения «окно vs предыдущее окно».
+    OKX здесь не участвует (у него REST с курсором) — сравнение окон и без
+    него репрезентативно, обе стратегии видят одинаковую картину.
+
+    Возвращает события time >= since и usd_value >= min_usd, отсортированные
+    по времени, с дедупликацией (источник, время, объём).
+    """
+    targets = {normalize_symbol(str(symbol), ex)
+               for ex in ("bybit", "binance", "gate")}
+    targets.add(str(symbol).upper())
+    out, seen = [], set()
+    stores = ((_bybit_ws_events, _bybit_ws_lock),
+              (_binance_ws_events, _binance_ws_lock),
+              (_gate_ws_events, _gate_ws_lock))
+    for (store, lock), name in zip(stores, ("Bybit", "Binance", "Gate.io")):
+        try:
+            async with lock:
+                raw = [e for e in store
+                       if str(e.get("symbol", "")) in targets
+                       and float(e.get("time", 0) or 0) >= since
+                       and float(e.get("usd_value", 0) or 0) >= min_usd]
+        except Exception:
+            raw = []
+        for e in raw:
+            key = (name, e.get("time"),
+                   round(float(e.get("usd_value", 0) or 0), 2))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(e)
+    out.sort(key=lambda e: float(e.get("time", 0) or 0))
+    return out
+
+
+def ws_liquid_ready() -> bool:
+    """Хотя бы один WS-источник ликвидаций подключён.
+
+    Нужен, чтобы отличать «ликвидаций нет — рынок.flat» (буферы живые,
+    событий нет) от «данных просто нет» (WS упал/монета не подписана).
+    """
+    try:
+        return any(bool(v.get("connected")) for v in _ws_status.values())
+    except Exception:
+        return False
+
+
 async def _gate_quanto(session, contract):
     """quanto_multiplier контракта (размер 1 контракта в базовой монете)."""
     spec = await get_gate_contract_spec(session, contract)

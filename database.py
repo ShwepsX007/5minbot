@@ -28,6 +28,14 @@ def init_db():
             pnl REAL, timestamp REAL
         );
     """)
+    # Миграция: каждая торговая система пишет свою статистику отдельно.
+    # strategy: '' (ручные сделки/старые записи), 'liquidations', 'trend'.
+    try:
+        cols = [r[1] for r in c.execute("PRAGMA table_info(trade_history)").fetchall()]
+        if "strategy" not in cols:
+            c.execute("ALTER TABLE trade_history ADD COLUMN strategy TEXT DEFAULT ''")
+    except Exception:
+        pass
     
     for k, v in [("m_threshold","2.0"), ("m_interval","30"), ("market_notifications","1"), ("demo_mode", "0"), ("stats_count", "10")]:
         c.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)",(k,v))
@@ -108,11 +116,35 @@ def remove_position(pid):
 def update_position_limits(pid, sl, tp):
     with get_db() as c: c.execute("UPDATE active_positions SET sl=?, tp=? WHERE id=?", (sl, tp, pid))
 
-def add_trade_history(is_demo, slug, question, outcome, side, size, entry_price, close_price, pnl):
-    with get_db() as c: c.execute("INSERT INTO trade_history (is_demo, slug, question, outcome, side, size, entry_price, close_price, pnl, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (is_demo, slug, question, outcome, side, size, entry_price, close_price, pnl, time.time()))
+def add_trade_history(is_demo, slug, question, outcome, side, size, entry_price, close_price, pnl, strategy=""):
+    with get_db() as c: c.execute("INSERT INTO trade_history (is_demo, slug, question, outcome, side, size, entry_price, close_price, pnl, timestamp, strategy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (is_demo, slug, question, outcome, side, size, entry_price, close_price, pnl, time.time(), strategy or ""))
 
-def get_trade_statistics(is_demo):
-    with get_db() as c: return [dict(r) for r in c.execute("SELECT * FROM trade_history WHERE is_demo=? ORDER BY timestamp DESC", (is_demo,)).fetchall()]
+def _trade_strategy_match(row, strategy):
+    """Фильтр строк trade_history по торговой системе.
 
-def clear_trade_statistics(is_demo):
-    with get_db() as c: c.execute("DELETE FROM trade_history WHERE is_demo=?", (is_demo,))
+    strategy=None      — все сделки;
+    strategy='trend'   — только «Движение за рынком»;
+    strategy='liquidations' — сделки стратегии ликвидаций; старые строки без
+      метки стратегии относятся к ней, если это up/down-окно (исторически
+      только она и писала в историю из автостратегий).
+    """
+    if not strategy:
+        return True
+    st = (row.get("strategy") or "").strip().lower()
+    if strategy == "trend":
+        return st == "trend"
+    if strategy == "liquidations":
+        return st == "liquidations" or (st == "" and "-updown-" in (row.get("slug") or ""))
+    return st == strategy
+
+def get_trade_statistics(is_demo, strategy=None):
+    with get_db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM trade_history WHERE is_demo=? ORDER BY timestamp DESC", (is_demo,)).fetchall()]
+    return [r for r in rows if _trade_strategy_match(r, strategy)]
+
+def clear_trade_statistics(is_demo, strategy=None):
+    with get_db() as c:
+        rows = c.execute("SELECT id, slug, strategy FROM trade_history WHERE is_demo=?", (is_demo,)).fetchall()
+        for r in rows:
+            if _trade_strategy_match(dict(r), strategy):
+                c.execute("DELETE FROM trade_history WHERE id=?", (r[0],))
