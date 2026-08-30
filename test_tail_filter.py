@@ -31,6 +31,8 @@
      порога между минимумом и максимумом в зависимости от объёма
      последнего часа относительно истории; режим «от среднего» и
      источник объёма «общий / только своя монета» (раздел 15).
+ 13. Фильтр отката сигнальной свечи (только первая сделка серии):
+     доля движения, отданная от экстремума к закрытию (раздел 16).
 """
 import asyncio
 import os
@@ -1188,6 +1190,57 @@ async def main():
     check("ручной ввод «общий» → all", ok and norm == "all", err)
     ok, norm, err = liq_menu.validate_manual_input("liq_dyn_thr_src", "своя монета")
     check("ручной ввод «своя монета» → self", ok and norm == "self", err)
+
+    # ============ 16. фильтр отката сигнальной свечи (первая сделка) ============
+    print("\n— Откат сигнальной свечи: (high−close)/(high−open) и зерно —")
+    import liq_strategy as _lq
+    # UP: движение 100→102 (high 102.5). close 101 → откат 1.5/2.5 = 60%.
+    cnd = {"open": 100.0, "close": 101.0, "high": 102.5, "low": 99.9}
+    b, txt = _lq.eval_candle_pullback(cnd, "UP", 50)
+    check("UP: откат 60% ≥ 50% → блок", b, txt)
+    b, txt = _lq.eval_candle_pullback(cnd, "UP", 75)
+    check("UP: откат 60% < 75% → пропуск", not b)
+    # DOWN: движение 100→98 (low 97.5). close 99 → откат (99−97.5)/2.5=60%.
+    cnd2 = {"open": 100.0, "close": 99.0, "high": 100.1, "low": 97.5}
+    b, _t = _lq.eval_candle_pullback(cnd2, "DOWN", 60)
+    check("DOWN: ровно 60% (порог включительно) → блок", b)
+    b, _t = _lq.eval_candle_pullback(cnd2, "DOWN", 61)
+    check("DOWN: 60% < 61% → пропуск", not b)
+    # закрытие ровно на экстремуме — отката нет
+    b, _t = _lq.eval_candle_pullback({"open": 100.0, "close": 102.0,
+                                      "high": 102.0, "low": 99.0}, "UP", 30)
+    check("закрытие на экстремуме — откат 0%, пропуск", not b)
+    # нет движения / нет данных / фильтр выключен
+    b, _t = _lq.eval_candle_pullback({"open": 100.0, "close": 100.0,
+                                      "high": 100.0, "low": 100.0}, "UP", 50)
+    check("нулевое движение — не мешаем", not b)
+    b, _t = _lq.eval_candle_pullback(None, "UP", 50)
+    check("нет свечи — не мешаем", not b)
+    b, _t = _lq.eval_candle_pullback(cnd, "UP", 0)
+    check("порог 0 — фильтр выключен", not b)
+    b, _t = _lq.eval_candle_pullback({"open": 100.0, "close": 98.0,
+                                      "high": 100.5, "low": 97.0}, "UP", 50)
+    check("UP-свеча закрылась ниже open (откат >100%) → блок", b)
+    # настройка и дефолты
+    check("дефолт liq_pullback_pct = 0 (выкл)",
+          _lq.DEFAULTS.get("liq_pullback_pct") == "0")
+    database.set_setting("liq_pullback_pct", "55")
+    check("get_pullback_pct читает настройку", _lq.get_pullback_pct() == 55.0)
+    database.set_setting("liq_pullback_pct", "0")
+    check("STAT_KEYS содержит счётчик фильтра",
+          "liq_stat_filter_pullback" in _lq.STAT_KEYS)
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+               "liq_strategy.py"), encoding="utf8").read()
+    check("фильтр встроен в _process_pending_impl перед входом",
+          "Фильтр отката сигнальной свечи" in src
+          and "get_series(symbol) == 0" in src)
+    # меню
+    keys = [k for k, _, _ in liq_menu.PARAMS]
+    check("liq_pullback_pct в меню настроек", "liq_pullback_pct" in keys)
+    ok, norm, err = liq_menu.validate_manual_input("liq_pullback_pct", "40")
+    check("ручной ввод 40 — принято", ok and norm == "40", err)
+    ok, _n, err = liq_menu.validate_manual_input("liq_pullback_pct", "120")
+    check("ручной ввод 120 — отклонён (>100)", not ok)
 
     print(f"\nИТОГ: {PASS} прошло, {FAIL} упало")
     return FAIL

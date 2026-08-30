@@ -107,6 +107,7 @@ STAT_KEYS = (
     "liq_stat_filter_impulse",  # отменено фильтром импульса
     "liq_stat_filter_oi",      # отменено фильтром OI
     "liq_stat_filter_cvd",     # отменено фильтром потока
+    "liq_stat_filter_pullback",  # отменено фильтром отката свечи (1-я сделка)
     "liq_stat_entries",        # реальных входов
 )
 
@@ -141,10 +142,11 @@ def _funnel_line() -> str:
     fi = _stat("liq_stat_filter_impulse")
     fo = _stat("liq_stat_filter_oi")
     fc = _stat("liq_stat_filter_cvd")
+    fp = _stat("liq_stat_filter_pullback")
     ent = _stat("liq_stat_entries")
     return (f"🔻 Воронка: сигналов *{sig}* → свеча отсеяла *{cc}* → "
-            f"фильтры *{ft + fi + fo + fc}* (хвост {ft} / импульс {fi} / "
-            f"OI {fo} / CVD {fc}) → входов *{ent}*")
+            f"фильтры *{ft + fi + fo + fc + fp}* (хвост {ft} / импульс {fi} / "
+            f"OI {fo} / CVD {fc} / откат {fp}) → входов *{ent}*")
 
 
 def _last_filters_line() -> str:
@@ -358,6 +360,16 @@ DEFAULTS = {
     "liq_loss_liq_on": "0",
     "liq_loss_liq_pct": "50",
     "liq_loss_liq_mode": "above",
+
+    # ===== ОТКАТ СИГНАЛЬНОЙ СВЕЧИ (фильтр только первой сделки) =====
+    # Перед входом по «чистому» сигналу (серия ещё не начата) смотрим,
+    # сколько сигнальная свеча отдала от своего экстремума к концу рынка.
+    # UP: (high − close) / (high − open); DOWN: (close − low) / (open − low).
+    # Откат >= N% от всего движения — импульс выдохся, внутри свечи уже
+    # пошёл разворот против нас, и вход в следующее окно — это покупка
+    # «хвоста». Такой вход отменяется. 0 — фильтр выключен.
+    # Шаги мартингейла фильтр НЕ касается: серию надо отыгрывать.
+    "liq_pullback_pct": "0",
 
     # ===== ПАУЗА СИГНАЛОВ ПОСЛЕ ОТМЕНЫ ФИЛЬТРОМ =====
     # Когда вход по монете отменил фильтр (хвост/импульс/OI/CVD), тот же
@@ -1504,12 +1516,20 @@ def _get_trade_stats(is_demo: int):
     except Exception:
         trades = []
     # Фильтр по slug: наши окна имеют вид "<asset>-updown-<tf>-<ts>".
-    # Слагов других стратегий этот шаблон не имеют.
+    # Сделки второй стратегии («Движение за рынком») тоже ходят в
+    # updown-окнах, но помечены strategy='trend' — их исключаем, чтобы
+    # статистика систем не пересекалась.
     def _is_liq(t):
         slug = str(t.get("slug", "") or "")
+        strat = str(t.get("strategy", "") or "").strip().lower()
+        if strat == "trend":
+            return False
         return "-updown-" in slug
     strat_trades = [t for t in trades if _is_liq(t)]
-    use = strat_trades if strat_trades else trades
+    # Фолбэк для старых данных — но сделки второй стратегии в него
+    # попадать не должны ни при каких условиях.
+    use = strat_trades or [t for t in trades
+                           if str(t.get("strategy") or "").strip().lower() != "trend"]
     if not use:
         return {
             "total": 0, "wins": 0, "losses": 0, "winrate": 0,
@@ -2204,6 +2224,47 @@ def resolve_state(candle: dict | None) -> str | None:
     if o <= 0 or c <= 0:
         return None
     return "UP" if c >= o else "DOWN"
+
+
+def get_pullback_pct() -> float:
+    """Порог отката сигнальной свечи, % (0 — фильтр выключен)."""
+    try:
+        pct = float(get_setting("liq_pullback_pct",
+                                DEFAULTS["liq_pullback_pct"]) or 0)
+    except (TypeError, ValueError):
+        pct = 0.0
+    return max(0.0, min(100.0, pct))
+
+
+def eval_candle_pullback(cndl: dict | None, direction: str | None,
+                         pct: float) -> tuple[bool, str]:
+    """Сколько сигнальная свеча отдала от экстремума к своему концу.
+
+    UP: откат = high − close, движение = high − open.
+    DOWN: откат = close − low, движение = open − low.
+    Если откат >= pct% от движения — входить в следующее окно нельзя
+    (движение выдохлось). Движения нет/нет данных — не мешаем (False).
+    Возвращает (заблокирован?, текст для лога/юзера)."""
+    if pct <= 0 or not cndl or direction not in ("UP", "DOWN"):
+        return False, ""
+    try:
+        o = float(cndl.get("open") or 0)
+        h = float(cndl.get("high") or 0)
+        l = float(cndl.get("low") or 0)
+        cl = float(cndl.get("close") or 0)
+    except (TypeError, ValueError):
+        return False, ""
+    if min(o, h, l, cl) <= 0:
+        return False, ""
+    total = (h - o) if direction == "UP" else (o - l)
+    if total <= 0:
+        return False, ""
+    retr = (h - cl) if direction == "UP" else (cl - l)
+    share = max(0.0, retr / total * 100.0)
+    ext = h if direction == "UP" else l
+    txt = (f"откат {share:.1f}% от движения (экстремум {ext:g} → "
+            f"закрытие {cl:g})")
+    return share >= pct, txt
 
 
 async def get_window_candle(session, symbol: str, timeframe: str,
@@ -3493,6 +3554,29 @@ async def _process_pending_impl(context):
             # === Свеча подтвердилась — проверяем фильтры памп/дампа ===
             pending.pop(symbol, None)
             _save_state(state)
+
+            # === Фильтр отката сигнальной свечи — ТОЛЬКО первая сделка ===
+            # Свеча отдала большую часть движения к концу рынка — импульс
+            # выдохся, и вход в следующее окно это «покупка хвоста».
+            # Шаги мартингейла не трогаем: серию надо отыгрывать.
+            pull_pct = get_pullback_pct()
+            if pull_pct > 0 and get_series(symbol) == 0:
+                blocked_pb, pb_txt = eval_candle_pullback(cndl, outcome, pull_pct)
+                if blocked_pb:
+                    _bump_stat("liq_stat_filter_pullback")
+                    _set_signal_cooldown(symbol)
+                    log.info(f"liq: 🌪 {symbol} {pb_txt} — вход {outcome} "
+                             f"отменён (фильтр первой сделки)")
+                    set_setting("liq_last_scan",
+                                f"[{symbol}] вход отменён: {pb_txt}")
+                    await _send(context, cid,
+                                f"🌪 *Вход отменён* `{symbol}` {outcome}\n"
+                                f"🕯 Сигнальная свеча {md_escape(pb_txt)} — "
+                                f"порог *{pull_pct:g}%*. Движение выдохлось, "
+                                f"первую сделку в серию не открываю.\n"
+                                f"_Шаги мартингейла этот фильтр не "
+                                f"касается._")
+                    continue
 
             allowed, why = can_open_for(symbol)
             if not allowed:
@@ -4837,7 +4921,8 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
         else:
             pnl = 0
         add_trade_history(is_demo_flag, slug, trade_question, outcome, "BUY",
-                          pos.get("shares", stake), entry_cents, close_price, pnl)
+                          pos.get("shares", stake), entry_cents, close_price, pnl,
+                          strategy="liquidations")
         series_total = round(prev_series_pnl + pnl, 2)
         series_map[symbol] = 0
         pnl_map.pop(symbol, None)
@@ -4872,7 +4957,8 @@ async def _settle_position(context, cid, c, state, symbol, pos, *,
     recovered = round(shares_cnt * (max(0, close_price) / 100.0), 2)
     pnl = round(recovered - stake, 2)
     add_trade_history(is_demo_flag, slug, trade_question, outcome, "BUY",
-                      shares_cnt, entry_cents, close_price, pnl)
+                      shares_cnt, entry_cents, close_price, pnl,
+                      strategy="liquidations")
 
     # Накопленный результат серии с учётом этой сделки. Досрочный выход по
     # свече часто закрывается не в ноль, поэтому долг серии — это НЕ сумма
