@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+bot_database.db
+bot_database.db-wal
+bot_database.db-shm
+bot.log*
+.env
+
+# Тестовое окружение
+.venv/
+.venv
