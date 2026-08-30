@@ -47,7 +47,7 @@ async def post_init(application):
     # подписаться до первого скана, а Binance не копил чужие символы.
     try:
         import liq_strategy as ls
-        symbols = ls.get_selected_symbols()
+        symbols = ls.flow_symbols()   # union монет обеих стратегий
         liq_api.set_symbols(symbols)
         orderflow.set_symbols(symbols)
     except Exception as e:
