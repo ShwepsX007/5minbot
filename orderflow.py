@@ -289,6 +289,22 @@ def cleanup():
             _trades[sym] = [t for t in arr if t[0] >= cutoff]
 
 
+def ensure_symbol(symbol: str):
+    """Добавляет монету к подписке, НЕ сбрасывая остальные (set_symbols
+    вызывается обеими стратегиями по очереди — additive-вариант нужен,
+    чтобы трендовая стратегия не выписывала монеты ликвидационной и наоборот)."""
+    global _desired_symbols, _symbols_version
+    if not symbol:
+        return
+    v = str(symbol).upper().replace("-", "_")
+    if not v.endswith("_USDT") and v.endswith("USDT"):
+        v = v[:-4] + "_USDT"
+    if v and v not in _desired_symbols:
+        _desired_symbols = _desired_symbols | {v}
+        _symbols_version += 1
+        _status["symbols"] = len(_desired_symbols)
+
+
 def status() -> dict:
     last = _status.get("last_msg_ts") or 0
     return {
